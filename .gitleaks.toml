@@ -1,0 +1,11 @@
+title = "Verity gitleaks config"
+
+# Use gitleaks' built-in rules for real secret formats (tokens, keys, high-entropy).
+[extend]
+useDefault = true
+
+# Design docs discuss secret *handling* — names and on-disk *locations* only, never
+# live values (see framework-spec.md). Don't scan them as if they were source.
+[allowlist]
+description = "Design docs reference secret handling but contain no live secrets"
+paths = ['''docs/.*''']

@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/seanerama/verity-framework/blob/main/schemas/role-permissions.schema.json",
+  "title": "Verity role capability policy",
+  "description": "Schema for commands/verity/<role>.permissions.json (contracts/role-capability-policy.md v1, ADR-0007) — the runtime-neutral declaration of what a role is ALLOWED to do, projected by each provider driver into that runtime's native controls. This artifact mirrors the zero-dependency validator in verity/bin/lib/agents/policy.cjs exactly. Fail-closed semantics beyond this schema, enforced at load time: a missing or invalid file refuses execution (exit 30) with no fallback to a runtime's default permission surface; every capability key defaults to false when absent; a codex projection that exceeds the capabilities block (workspace-write without write_repository) is schema-valid but LOAD-INVALID; worker overrides may only narrow a projection, never widen it. Capability keys beyond the listed ones are additive v1.x extensions — booleans, defaulting closed.",
+  "type": "object",
+  "required": ["schema_version", "capabilities", "codex"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "capabilities": {
+      "description": "The frozen v1 capability vocabulary plus additive v1.x keys. Absence never grants anything.",
+      "type": "object",
+      "properties": {
+        "read_repository": { "type": "boolean", "default": false },
+        "write_repository": { "type": "boolean", "default": false },
+        "run_tests": { "type": "boolean", "default": false },
+        "git_read": { "type": "boolean", "default": false },
+        "git_write": { "type": "boolean", "default": false },
+        "github_read": { "type": "boolean", "default": false },
+        "github_write": { "type": "boolean", "default": false },
+        "network": { "type": "boolean", "default": false },
+        "deploy": { "type": "boolean", "default": false },
+        "write_protected_paths": {
+          "description": "Additive v1.x key (stage 9): may the role's own edits touch the protected config roots (.github/**, .verity/**)? When false, the codex driver generates protected-path write-denial rules.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": { "type": "boolean" }
+    },
+    "codex": {
+      "description": "The Codex projection — narrower than, never wider than, the capabilities block. 'danger-full-access' is not a legal sandbox value in v1: any future unrestricted mode is a NEW contract with its own explicit opt-in.",
+      "type": "object",
+      "required": ["sandbox"],
+      "properties": {
+        "sandbox": { "enum": ["read-only", "workspace-write"] },
+        "approval": {
+          "enum": ["untrusted", "on-request", "never"],
+          "default": "never"
+        },
+        "ignore_user_config": {
+          "description": "Headless runs ignore the user's global Codex config by default so it cannot change autonomous behavior (ADR-0007); only an explicit false opts out.",
+          "type": "boolean",
+          "default": true
+        },
+        "ignore_rules": { "type": "boolean", "default": false }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Edit(**/*.md)",
+  "Write(**/*.md)",
+  "Bash(verity recovery:*)",
+  "Bash(verity status:*)",
+  "Bash(gh issue create:*)",
+  "Bash(gh issue comment:*)",
+  "Bash(gh issue list:*)",
+  "Bash(gh issue view:*)"
+]

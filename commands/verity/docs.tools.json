@@ -1,0 +1,13 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Edit(docs/**)",
+  "Edit(**/*.md)",
+  "Write(docs/**)",
+  "Write(**/*.md)",
+  "Bash(verity handoff:*)",
+  "Bash(git:*)",
+  "Bash(gh pr create:*)",
+  "Bash(gh pr view:*)"
+]

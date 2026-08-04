@@ -1,0 +1,8 @@
+{
+  "verity": 1,
+  "outcome": "completed",
+  "gate": null,
+  "artifacts": ["docs/plan.md", "stage-instructions/stage-1.md"],
+  "reason": null,
+  "summary": "Planned stage 1 and wrote the stage instructions."
+}

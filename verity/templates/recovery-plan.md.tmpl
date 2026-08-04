@@ -1,0 +1,29 @@
+# Recovery Plan
+
+> Owned by the **SRE** (framework-spec §6, Role 10). Steady-state readiness — NOT the
+> deploy act (that's the Release/Deploy Operator).
+
+## Rollback
+
+- Re-pin the previous image digests and re-run the project's `deploy.sh`.
+- Safe because migrations are **additive-only** (an image rollback never strands the schema).
+- Back up the env before every deploy (`.env.bak.pre-<version>`).
+
+## Backup coverage (every persistent store listed — backed up OR acceptable-loss)
+
+- [ ] Database — backed up (PITR / scheduled)
+- [ ] (other volumes) — backed up, or **explicitly** marked acceptable-loss
+      (no silent gaps — the un-backed-up-FAQ-volume lesson)
+
+## Intermittent environment ("asleep vs incident")
+
+- If health/SSH is unreachable: is the environment deallocated on a schedule? Start it
+  first. Only treat it as an incident once confirmed up. (This is a NORMAL state.)
+
+## Secret lifecycle
+
+- [ ] Rotation schedule defined; no never-rotated/exposed credentials at go-live.
+
+## Incident response
+
+- Triage → mitigate (often: an Operator rollback) → file an issue → post-incident note.

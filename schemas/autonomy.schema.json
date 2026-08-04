@@ -1,0 +1,146 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/seanerama/verity-framework/blob/main/schemas/autonomy.schema.json",
+  "title": "Verity autonomy policy",
+  "description": "Schema for .verity/autonomy.yml (verity-autonomy-technical-sketch.md §2). All keys are optional; the effective policy is the file deep-merged over the defaults shown here. HARD INVARIANTS enforced in code, beyond this schema: review.low_risk.protected_paths always includes '.github/**' and '.verity/**'; gates always includes 'golive'; mode 'manual' means the autonomy worker exits 0 immediately with 'autonomy disabled'.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "description": "Autonomy mode. 'manual' = worker disabled (pre-feature behavior).",
+      "enum": ["manual", "supervised", "autonomous"],
+      "default": "manual"
+    },
+    "auto_advance": {
+      "description": "Roles allowed to chain without a human gate (supervised+).",
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["plan", "build", "test", "docs"]
+    },
+    "gates": {
+      "description": "Pause points that ALWAYS wait for a human. 'golive' is forced in code even if removed here.",
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["review:merge", "ship:prod", "golive"]
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "trust": {
+          "description": "Reviewer merge authority: 0 none, 1 low-risk auto-merge, 2 full. Raising it via the CLI requires --confirm and records an ADR.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2,
+          "default": 0
+        },
+        "low_risk": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_changed_lines": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 150
+            },
+            "allowed_paths": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": ["docs/**", "tests/**", "**/*.md"]
+            },
+            "protected_paths": {
+              "description": "'.github/**' and '.verity/**' are forced in code even if removed here.",
+              "type": "array",
+              "items": { "type": "string" },
+              "default": ["**/auth/**", ".github/**", "scripts/deploy*", ".verity/**"]
+            },
+            "require_ci_green": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_chained_roles": { "type": "integer", "minimum": 1, "default": 6 },
+        "max_tokens_per_run": { "type": "integer", "minimum": 1, "default": 2000000 },
+        "max_wall_clock_min": { "type": "integer", "minimum": 1, "default": 45 },
+        "max_runs_per_day": { "type": "integer", "minimum": 1, "default": 24 },
+        "max_usd_per_day": { "type": "number", "minimum": 0, "default": 25.0 },
+        "unknown_cost_behavior": {
+          "description": "What the worker does when a role reports UNKNOWN cost (est_usd null — never $0, ADR-0008). 'gate' pauses at the existing human gate (default until a provider's cost accounting is proven), 'fail' stops the run, 'allow_with_token_limit' proceeds bounded by token ceilings alone. Null never counts against the daily budget breaker.",
+          "enum": ["gate", "allow_with_token_limit", "fail"],
+          "default": "gate"
+        }
+      }
+    },
+    "notify": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mention": {
+          "description": "GitHub logins to @ on gate/fail/circuit.",
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "webhook": {
+          "description": "Optional POST url.",
+          "type": ["string", "null"],
+          "default": null
+        }
+      }
+    },
+    "humans": {
+      "description": "Logins; a bot token matching any of these refuses to start.",
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "commit_usage": {
+      "description": "Worker commits .verity/usage.csv after each run with message 'chore(verity): usage <run-id>' (verity-autonomy-technical-sketch.md §3.4).",
+      "type": "boolean",
+      "default": true
+    },
+    "agent": {
+      "description": "Which model runtime the autonomy worker drives (stage 9, ADR-0005/0007/0009). Defaults keep every pre-existing policy Claude-backed; codex requires an explicit provider edit. The worker resolves ONE immutable effective config per run from this block. NO unrestricted-access value exists anywhere in this schema (ADR-0007).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "description": "Headless runtime the worker dispatches roles to.",
+          "enum": ["claude", "codex"],
+          "default": "claude"
+        },
+        "model": {
+          "description": "Optional model override passed to the provider; null = the provider's default.",
+          "type": ["string", "null"],
+          "default": null
+        },
+        "sandbox": {
+          "description": "Codex-only sandbox override. May only NARROW the role's .permissions.json projection — read-only over workspace-write is allowed, the reverse is refused (fail closed, ADR-0007). 'danger-full-access' is not representable.",
+          "enum": ["read-only", "workspace-write", null],
+          "default": null
+        },
+        "approval": {
+          "description": "Codex-only approval-policy override. May only NARROW the role's projection ('never' permits the least human-mediated escalation).",
+          "enum": ["untrusted", "on-request", "never", null],
+          "default": null
+        },
+        "ignore_user_config": {
+          "description": "Headless runs ignore the user's global provider config by default so it cannot change autonomous behavior (ADR-0007). The role's .permissions.json projection governs each invocation.",
+          "type": "boolean",
+          "default": true
+        },
+        "ignore_rules": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+  }
+}

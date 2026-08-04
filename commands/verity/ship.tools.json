@@ -1,0 +1,19 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Bash(git tag:*)",
+  "Bash(git push:*)",
+  "Bash(git log:*)",
+  "Bash(git status:*)",
+  "Bash(verity release:*)",
+  "Bash(verity smoke:*)",
+  "Bash(verity status:*)",
+  "Bash(verity config get:*)",
+  "Bash(./deploy.sh:*)",
+  "Bash(bash deploy.sh:*)",
+  "Bash(gh release:*)",
+  "Bash(gh run list:*)",
+  "Bash(gh run view:*)",
+  "Bash(gh run watch:*)"
+]

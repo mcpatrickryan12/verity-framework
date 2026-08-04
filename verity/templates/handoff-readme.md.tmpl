@@ -1,0 +1,21 @@
+# Handoff — agent quickstart
+
+Reading order for an agent (or person) joining this project cold — this is what makes
+"rejoin with zero setup" real (framework-spec §6, H5):
+
+1. **`STATUS.md`** — what's live right now (deployed version, environments).
+2. **`docs/ARCHITECTURE.md`** — how the system works.
+3. **The brief in this folder** for the feature you're picking up.
+4. **`verity state view`** — what's done and what's unblocked next.
+
+## The working loop
+
+```
+verity stage branch <N>     # branch for the stage
+# implement + write tests (incl. UI-smoke if user-facing)
+verity stage pr <N> --issue <M>
+# CI must be all-green
+/verity:review              # a DIFFERENT reviewer verifies against source + merges
+```
+
+You never merge your own work. Contracts are frozen — additive changes only.

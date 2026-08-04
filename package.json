@@ -1,0 +1,47 @@
+{
+  "name": "verity-framework",
+  "version": "1.1.0",
+  "description": "Verity — a CI/CD-native, GitHub-native AI delivery framework: specialized roles from idea to operated production, plus an optional headless autonomy worker, gated and audited through GitHub.",
+  "keywords": [
+    "verity",
+    "verity-auto",
+    "ai",
+    "ci-cd",
+    "github",
+    "devops",
+    "agent",
+    "framework",
+    "autonomy"
+  ],
+  "author": "Sean Mahoney",
+  "license": "MIT",
+  "homepage": "https://github.com/seanerama/verity-framework#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seanerama/verity-framework.git"
+  },
+  "bugs": {
+    "url": "https://github.com/seanerama/verity-framework/issues"
+  },
+  "bin": {
+    "verity": "verity/bin/verity.cjs",
+    "verity-worker": "verity/worker/index.cjs"
+  },
+  "files": ["verity", "commands", "schemas", "README.md", "CHANGELOG.md", "LICENSE"],
+  "engines": {
+    "node": ">=16.7.0"
+  },
+  "verity": {
+    "claudeCodeMinVersion": "2.1.170",
+    "codexMinVersion": "0.42.0",
+    "knowingMinVersion": "0.15.1"
+  },
+  "scripts": {
+    "test": "node scripts/run-tests.cjs",
+    "lint": "biome ci .",
+    "prepublishOnly": "npm run lint && npm test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4"
+  }
+}

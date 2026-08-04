@@ -1,0 +1,21 @@
+{
+  "baseUrl": "http://localhost:8080",
+  "flows": [
+    {
+      "name": "home page loads and renders",
+      "steps": [
+        { "goto": "/" },
+        { "expectSelector": "body" }
+      ]
+    },
+    {
+      "name": "example: the help button actually opens help",
+      "steps": [
+        { "goto": "/" },
+        { "click": "#help-button" },
+        { "expectSelector": "#help-panel" },
+        { "expectText": "How can I help" }
+      ]
+    }
+  ]
+}

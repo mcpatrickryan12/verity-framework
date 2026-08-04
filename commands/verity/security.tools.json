@@ -1,0 +1,10 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Write",
+  "Edit(docs/**)",
+  "Bash(verity security:*)",
+  "Bash(verity adr:*)",
+  "Bash(npm audit:*)"
+]

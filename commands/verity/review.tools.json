@@ -1,0 +1,11 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Bash(gh pr view:*)",
+  "Bash(gh pr diff:*)",
+  "Bash(gh pr checks:*)",
+  "Bash(gh pr comment:*)",
+  "Bash(verity review checklist:*)",
+  "Bash(verity state:*)"
+]

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "capabilities": {
+    "read_repository": true,
+    "write_repository": false,
+    "run_tests": false,
+    "git_read": false,
+    "git_write": false,
+    "github_read": false,
+    "github_write": false,
+    "network": false,
+    "deploy": false
+  },
+  "codex": {
+    "sandbox": "read-only",
+    "approval": "never",
+    "ignore_user_config": true,
+    "ignore_rules": false
+  }
+}

@@ -1,0 +1,9 @@
+[
+  "Read",
+  "Bash(curl:*)",
+  "Bash(verity smoke run:*)",
+  "Bash(gh issue create:*)",
+  "Bash(gh issue list:*)",
+  "Bash(gh issue view:*)",
+  "Bash(gh issue comment:*)"
+]

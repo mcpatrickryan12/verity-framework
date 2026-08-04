@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "verity://schemas/agent-result.schema.json",
+  "title": "Verity role outcome (provider structured final output)",
+  "description": "The role-outcome shape a provider's structured final message (e.g. Codex --output-last-message) must satisfy before it is trusted. Normalized by the provider driver into contracts/agent-result.md v1; schema-invalid output fails closed to infra_error. Validation is enforced by the hand-rolled validator in verity/bin/lib/agents/result-contract.cjs (zero-dependency policy) — this file is the published contract artifact that code must match. Artifact entries are relative repo paths: absolute paths and any '..' traversal segment are rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verity", "outcome", "gate", "artifacts", "reason", "summary"],
+  "properties": {
+    "verity": { "const": 1 },
+    "outcome": { "enum": ["completed", "gated", "failed", "no-op"] },
+    "gate": { "type": ["string", "null"] },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "allOf": [
+          { "not": { "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)" } },
+          { "not": { "pattern": "^([\\\\/]|[A-Za-z]:[\\\\/])" } }
+        ]
+      }
+    },
+    "reason": { "type": ["string", "null"] },
+    "summary": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "gated" } } },
+      "then": { "properties": { "gate": { "type": "string", "minLength": 1 } } }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "failed" } } },
+      "then": { "properties": { "reason": { "type": "string", "minLength": 1 } } }
+    }
+  ]
+}

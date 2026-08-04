@@ -1,0 +1,18 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Write",
+  "Edit",
+  "Bash(verity slug:*)",
+  "Bash(verity identity:*)",
+  "Bash(verity scaffold:*)",
+  "Bash(git init:*)",
+  "Bash(git add:*)",
+  "Bash(git commit:*)",
+  "Bash(git status:*)",
+  "Bash(gh repo create:*)",
+  "Bash(gh run list:*)",
+  "Bash(gh run view:*)",
+  "Bash(gh run watch:*)"
+]

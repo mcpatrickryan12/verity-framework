@@ -1,0 +1,33 @@
+# Your Verity deployment methods
+
+> **Global to YOU, across every project.** This is your private inventory of the
+> places you *can* deploy to. The Architect (`/verity:architect`) reads it with
+> `verity deployment list` and works with you to choose a target for each app.
+>
+> ⚠️ **Reference credential LOCATIONS, never paste secrets.** Point at a key file,
+> an SSO profile, or a secret-store entry — never an actual key, password, or token.
+> This file lives at `~/.verity/deployment-methods.md`; it is NOT in any repo, but
+> treat it as sensitive anyway.
+>
+> Edit it any time with `verity deployment edit` (or open the path printed by
+> `verity deployment path`) — or run **`/verity:deploy-setup`**, the guided interview
+> that builds this catalog for you. Add one `## <id> — <Title>` section per method, and
+> set `- **status:** active` once it is real (the two below are `example` — replace or
+> delete them).
+
+## aws-ec2 — AWS EC2 over SSH (example — edit or delete)
+- **status:** example
+- **provider:** AWS
+- **host:** `<ec2-public-dns-or-elastic-ip>`
+- **user:** `ubuntu`
+- **access:** `ssh -i ~/.ssh/<your-key>.pem ubuntu@<host>` — key *location* only
+- **notes:** region `<e.g. us-east-1>`; the security group must allow your IP on
+  ports 22 (SSH) and 443 (HTTPS).
+
+## local-server — Local network server (example — edit or delete)
+- **status:** example
+- **provider:** self-hosted (LAN)
+- **host:** `<hostname-or-10.0.0.x>`
+- **user:** `<you>`
+- **access:** `ssh <user>@<host>` over the local network / VPN
+- **notes:** only reachable on the LAN or while connected to the VPN — not public.

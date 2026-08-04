@@ -1,0 +1,18 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Write",
+  "Edit",
+  "Bash(node -v:*)",
+  "Bash(gh auth status:*)",
+  "Bash(git remote:*)",
+  "Bash(git rev-parse:*)",
+  "Bash(verity --version:*)",
+  "Bash(verity install:*)",
+  "Bash(verity autonomy set:*)",
+  "Bash(verity autonomy validate:*)",
+  "Bash(verity autonomy show:*)",
+  "Bash(verity usage:*)",
+  "Bash(gh issue create:*)"
+]

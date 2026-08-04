@@ -1,0 +1,8 @@
+{
+  "verity": 1,
+  "outcome": "gated",
+  "gate": "review:merge",
+  "artifacts": [],
+  "reason": "merge needs a human",
+  "summary": "PR is green and awaiting merge approval."
+}

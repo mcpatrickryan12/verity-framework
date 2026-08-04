@@ -1,0 +1,11 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Write",
+  "Edit",
+  "Bash(verity deployment list:*)",
+  "Bash(verity deployment show:*)",
+  "Bash(verity deployment path:*)",
+  "Bash(verity deployment ensure:*)"
+]

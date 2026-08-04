@@ -1,0 +1,14 @@
+# Security Invariants
+
+> Defined by the **Security Auditor**; ENFORCED by the **Reviewer** on every PR
+> (framework-spec §6). Verify each against the ACTUAL diff/source — not the PR
+> description. Edit this list as the system's threat surface grows.
+
+- [ ] Least-privilege tool/permission registries — a mode is never offered tools it doesn't need
+- [ ] Caller-scoped reads are NON-WIDENABLE (a user can only ever see their own data)
+- [ ] Path / symlink confinement on any file access
+- [ ] External or consequential actions are draft-then-confirm, never autonomous
+- [ ] No secrets in the repo, image, or source snapshot (names/locations only)
+- [ ] Migrations are additive (no destructive schema change)
+- [ ] AuthN/AuthZ enforced on every new endpoint
+- [ ] Inputs validated; outputs escaped (no injection / XSS)

@@ -1,0 +1,17 @@
+[
+  "Read",
+  "Grep",
+  "Glob",
+  "Write",
+  "Edit",
+  "Bash(verity identity get:*)",
+  "Bash(verity stage:*)",
+  "Bash(verity contract:*)",
+  "Bash(verity feature:*)",
+  "Bash(verity adr:*)",
+  "Bash(verity state:*)",
+  "Bash(gh issue create:*)",
+  "Bash(gh issue edit:*)",
+  "Bash(gh issue view:*)",
+  "Bash(gh issue list:*)"
+]
