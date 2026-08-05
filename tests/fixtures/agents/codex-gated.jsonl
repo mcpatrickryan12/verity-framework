@@ -1,6 +1,6 @@
 {"type":"thread.started","thread_id":"th_002"}
 {"type":"turn.started"}
-{"type":"item.started","item":{"id":"item_0","item_type":"command_execution","command":"gh pr view 9","status":"in_progress"}}
-{"type":"item.completed","item":{"id":"item_0","item_type":"command_execution","command":"gh pr view 9","exit_code":0,"status":"completed"}}
-{"type":"item.completed","item":{"id":"item_1","item_type":"agent_message","text":"Waiting on a human.\n{\"verity\":1,\"outcome\":\"gated\",\"gate\":\"review:merge\",\"artifacts\":{\"pr\":9},\"reason\":\"merge needs a human\"}"}}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"gh pr view 9","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"gh pr view 9","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Waiting on a human.\n{\"verity\":1,\"outcome\":\"gated\",\"gate\":\"review:merge\",\"artifacts\":{\"pr\":9},\"reason\":\"merge needs a human\"}"}}
 {"type":"turn.completed","usage":{"input_tokens":800,"cached_input_tokens":0,"output_tokens":120,"reasoning_output_tokens":40,"total_tokens":960}}

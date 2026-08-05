@@ -75,8 +75,10 @@ answer makes it moot.
 5. **Runtime — which agent executes headless roles (`agent.provider`)?**
    - *Claude Code* (default) — the existing path; nothing extra to configure.
    - *OpenAI Codex CLI* — the worker drives `codex exec` under the role's portable
-     capability policy (fail-closed sandbox + generated command rules). Gather only
-     what Verity needs:
+     capability policy: the coarse Codex sandbox, a child environment built from a
+     passlist (credentials only where a capability grants them), and mandatory
+     post-run invariants that revert and fail loudly (tier 1 containment, ADR-0011).
+     Gather only what Verity needs:
      - **local worker only** — remind them Actions is deferred for Codex (ADR-0009); the
        driver from Q1 must be cron or manual.
      - **model override** (`agent.model`) — optional; null uses Codex's default.
@@ -85,6 +87,23 @@ answer makes it moot.
        reads or stores the credential; validation is `verity doctor --agent codex`.
      - **trust level** — same ladder as Q4; recommend starting supervised + trust 0 and
        point at the supervised Codex canary (docs/dev/codex-headless-canary.md).
+     - **acknowledged enforcement gaps** (`agent.acknowledged_enforcement_gaps`) —
+       ADR-0011's honesty rule: a restriction no mechanism enforces refuses the run
+       (exit 30 `unenforceable-policy`). Today that is `network: false`, which
+       `codex exec` cannot enforce, so a Codex worker needs
+       `acknowledged_enforcement_gaps: [network]` or every dispatch is refused. Say
+       plainly what it means — network access is NOT blocked, only unclaimed — and
+       leave it absent for anyone unwilling to accept that.
+     - **containment tier** (`agent.containment_tier`) — absent (the default) means
+       tier 1: violations are caught and reverted AFTER they happen, which is adequate
+       for supervised/trust-0. `2` additionally runs every role in a disposable shaped
+       workspace (protected paths physically absent) with a gated merge-back deciding
+       what may propagate back — the only tier under which UNATTENDED Codex autonomy
+       (`mode: autonomous`) is permitted; below it the worker refuses at startup with
+       `containment-tier-required`. Offer tier 2 ONLY to someone who has run the
+       real-binary tier-2 canary (docs/dev/codex-headless-canary.md §5), and tell them
+       its cost: the workspace is derived from HEAD, so a role's own commits and any
+       uncommitted local work do not cross the boundary.
      - **unknown-cost behavior** (`limits.unknown_cost_behavior`) — Codex reports no exact
        per-run dollar cost, and unknown is never $0 (ADR-0008). Default `gate` pauses each
        run for a human until cost accounting is proven; `allow_with_token_limit` runs under

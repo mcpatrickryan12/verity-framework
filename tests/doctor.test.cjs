@@ -12,6 +12,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const agentExec = require('../verity/bin/lib/agent-exec.cjs');
+// Stage 12: the feature matrix the codex too-old diagnosis is derived from.
+const codexFeatures = require('../verity/bin/lib/agents/codex-features.cjs');
 const doctor = require('../verity/bin/lib/doctor.cjs');
 
 const CLI = path.join(__dirname, '..', 'verity', 'bin', 'verity.cjs');
@@ -346,6 +348,49 @@ test('checkBinary: missing / unparsable / too-old / ok via injected exec', () =>
   assertEqual(ok.why, null);
 });
 
+// Stage 12: the pin only works if the probe can read what the binary actually
+// prints. The REAL `codex --version` output carries a `codex-cli ` PREFIX
+// (spike header: `codex-cli 0.146.0`) — if parseVersion tripped on it, every
+// codex version check would misreport and the pin would bind nothing at all.
+// Pinned here with the observed string, byte for byte.
+test('checkBinary/parseVersion: the REAL `codex --version` form (`codex-cli 0.146.0`)', () => {
+  assertEqual(
+    JSON.stringify(doctor.parseVersion('codex-cli 0.146.0')),
+    '[0,146,0]',
+    'the codex-cli prefix does not shift the parse',
+  );
+  const codexExec = (out) => () => ({ status: 0, stdout: out });
+
+  const at = doctor.checkBinary('codex', {
+    exec: codexExec('codex-cli 0.146.0\n'),
+    minVersion: '0.146.0',
+  });
+  assertEqual(at.version, '0.146.0', 'version extracted from the prefixed line');
+  assertEqual(at.ok, true, 'exactly the pin passes');
+  assertEqual(at.why, null);
+  assertEqual(at.output, 'codex-cli 0.146.0', 'the raw first line is reported verbatim');
+
+  const below = doctor.checkBinary('codex', {
+    exec: codexExec('codex-cli 0.145.9\n'),
+    minVersion: '0.146.0',
+  });
+  assertEqual(below.why, 'too-old', 'a lower version is caught, not silently accepted');
+  assertEqual(below.version, '0.145.9');
+
+  const above = doctor.checkBinary('codex', {
+    exec: codexExec('codex-cli 1.0.0\n'),
+    minVersion: '0.146.0',
+  });
+  assertEqual(above.ok, true, 'newer passes');
+  // The comparison is numeric, not lexical: '0.42.0' > '0.146.0' as strings,
+  // and reading it that way is exactly how a bad pin would pass unnoticed.
+  const legacy = doctor.checkBinary('codex', {
+    exec: codexExec('codex-cli 0.42.0\n'),
+    minVersion: '0.146.0',
+  });
+  assertEqual(legacy.why, 'too-old', '0.42.0 < 0.146.0 — compared as numbers, never as strings');
+});
+
 test('checkBinary is the single shared probe: agent-exec re-exports its parse helpers', () => {
   assertEqual(agentExec.parseVersion, doctor.parseVersion, 'one parseVersion');
   assertEqual(agentExec.compareVersions, doctor.compareVersions, 'one compareVersions');
@@ -531,6 +576,41 @@ test('doctor --agent codex: each distinct failure diagnosis carries a remediatio
   assert(
     byName['codex-install-state'].detail.includes('Run: verity install --codex'),
     'remediation',
+  );
+});
+
+// Stage 12: the too-old row is the one place an operator is told to upgrade, so
+// it is the one place the REASON has to appear. "codex 0.1.0 is below 0.146.0"
+// with no feature named is exactly the unauditable claim the historical 0.42.0
+// pin got away with for three stages.
+test('doctor --agent codex: the too-old diagnosis NAMES the feature motivating the pin', () => {
+  const fx = fixture();
+  fx.stub('git', GIT_OK);
+  fx.stub('gh', GH_OK);
+  fx.stub('codex', CODEX_OLD);
+  seedCodexInstall(fx);
+  const res = run(fx, ['--agent', 'codex']);
+  assertEqual(res.code, 1);
+  const detail = rowsByName(res.out).byName.codex.detail;
+  const motivating = codexFeatures.motivatingFeatures();
+  assert(motivating.length > 0, 'at least one feature justifies the pin');
+  for (const feature of motivating) {
+    assert(detail.includes(feature), `too-old detail must name '${feature}' (got: ${detail})`);
+  }
+  assert(detail.includes(codexFeatures.SPIKE_DOC), 'and point at the real-CLI evidence');
+  // The stage-9 shape is EXTENDED, not rewritten: pin, key and remedy all stay.
+  assert(detail.includes(MIN_CODEX), 'still names the pin');
+  assert(detail.includes('codexMinVersion'), 'still names the pin key');
+  assert(detail.includes('Run: npm install -g @openai/codex@latest'), 'still names the remedy');
+  // …and rows WITHOUT a motivation are byte-identical to their stage-1 output.
+  const claudeRow = doctor.checkDependency(
+    { name: 'claude', binary: 'claude', minVersionKey: 'claudeCodeMinVersion' },
+    { exec: () => ({ status: 0, stdout: '1.0.0 (Claude Code)\n' }) },
+  );
+  assertEqual(
+    claudeRow.detail,
+    'claude 1.0.0 is below the configured minimum 2.1.170 (package.json verity.claudeCodeMinVersion)',
+    'a row with no minVersionMotivation is unchanged',
   );
 });
 

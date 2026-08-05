@@ -8,7 +8,7 @@ Most AI coding tools stop when the code is written — leaving you to find out l
 
 It does that by running your project as a sequence of specialized AI roles — a vision assistant, an architect, a builder, a reviewer, a release operator, a verifier, and more — that hand work to each other through clear contracts, with **GitHub as the single source of truth**. It's CI/CD-native and GitHub-native by design, built for projects going *beyond a prototype* into real, operated production. (Verity is a clean-room successor to [spec-driven-devops](https://www.npmjs.com/package/spec-driven-devops) 1.4.)
 
-> 📦 Published as [`verity-framework`](https://www.npmjs.com/package/verity-framework) on npm · works with **Claude Code** and **OpenCode**.
+> 📦 Published as [`verity-framework`](https://www.npmjs.com/package/verity-framework) on npm · works with **Claude Code**, **Codex CLI**, and **OpenCode**.
 
 ## Get started
 
@@ -16,7 +16,6 @@ It does that by running your project as a sequence of specialized AI roles — a
 
 - **Autonomy** — a headless [`verity-worker`](docs/autonomy.md) that picks up labeled work, runs the same roles you would, and pauses at every human gate. Kill switch first, supervised + trust 0 to start.
 - **Deployment by interview** — run [`/verity:autonomy-setup`](commands/verity/autonomy-setup.md) and answer a handful of questions; it generates your tailored `.verity/autonomy.yml`, the cron line and/or Actions workflow, bot + secrets checklists, and a `DEPLOYMENT.md`.
-- **Friction kit** — [document your first run](docs/dev/friction-kit/) and capture every snag, mapped to the part of the framework that owns it.
 
 ## What makes it different
 
@@ -60,12 +59,31 @@ verity install --claude        # or: --opencode | --codex
 verity doctor
 ```
 
+### Host matrix
+
+Verity runs on three hosts. Install flag, interactive syntax, and where headless
+/ autonomy is available differ per host — this table is the honest summary:
+
+| Host | Install | Interactive invocation | Headless (`agent-exec`) | Local autonomy worker | GitHub Actions autonomy |
+|---|---|---|---|---|---|
+| **Claude Code** | `verity install --claude` | `/verity:vision` | Supported | Supported | Supported |
+| **Codex CLI** | `verity install --codex` | `$verity-vision` | Supported (tier-1 containment) | Supervised: supported · unattended: opt-in tier-2, default off | **Deferred — local only (ADR-0009)** |
+| **OpenCode** | `verity install --opencode` | `/verity-vision` | Interactive only | Interactive only | Interactive only |
+
+Full Codex walkthrough, autonomy config, and troubleshooting: **[QUICKSTART.md → Codex CLI](QUICKSTART.md#codex-cli)**.
+
 **Codex CLI users:** `verity install --codex` installs the roles as user-scoped
 skills under `~/.agents/skills/verity-<role>/` (engine under `~/.agents/verity`).
-Roles are invoked explicitly — e.g. `$verity-vision` — and never activate
-implicitly. Interactive use only for now: headless `agent-exec`/autonomy support
-for Codex is staged separately (see the changelog). After installing, confirm
-Codex lists the skills with `/skills`.
+Roles are invoked explicitly — e.g. `$verity-vision`, never `/verity:*`, and they
+never activate implicitly. After installing, confirm Codex lists the skills with
+`/skills`, and check host deps with `verity doctor --agent codex`. Beyond
+interactive use, Codex also has **headless** (`verity agent-exec <role> --agent
+codex`) and **local autonomy** support behind explicit opt-in. Unlike Claude —
+whose `--allowed-tools` allowlist its harness enforces at write time — `codex
+exec` ignores permission profiles, so Verity keeps Codex runs safe by
+**containment** (absent credentials + post-run invariants + an opt-in tier-2
+disposable workspace), not by Codex enforcing the role policy. GitHub Actions
+autonomy for Codex is deferred; run the Codex worker locally only.
 
 > Autonomy is opt-in and off by default — installing gives you the hand-driven
 > roles; enable the worker later with `/verity:autonomy-setup` when you want it.
@@ -101,21 +119,18 @@ When the Architect picks a target it sets up the per-app access file — `verity
 
 ## Guides
 
-Interactive, beginner-friendly, and fully self-contained — clone or download the repo and open them in any browser (no server or internet needed):
+Start with the quickstart, then go deeper as you need to:
 
-- [**Overview**](docs/verity-overview.html) — what Verity is and the mental model, no jargon assumed
-- [**Usage**](docs/verity-usage.html) — install + command-by-command recipes + pro tips (Claude Code / OpenCode toggle)
-- [**Flows**](docs/verity-flows.html) — start-from-scratch vs. add-to-an-existing-project, side by side ([editable `.drawio`](docs/verity-flows.drawio))
+- [**Quickstart**](QUICKSTART.md) — from a fresh machine to a moving project, step by step, no jargon assumed
+- [**What's different**](docs/whats-different.md) — the mental model: what the optional autonomy layer adds on top of the classic hand-driven framework
 - [**Command reference**](docs/commands.md) — all 15 `/verity:*` roles and what each one does
 - [**Autonomy**](docs/autonomy.md) — the headless `verity-worker`: kill switch, modes, trust ladder, labels, approvals, cron + Actions + bot setup, cost tracking
-- [**Deploy kit**](docs/dev/deploy-kit/) — `/verity:autonomy-setup`, the interview that generates your worker deployment
-- [**Friction kit**](docs/dev/friction-kit/) — instrument and document your first run, capturing friction mapped to tasks
-- [**Explainer kit**](docs/explainer-kit.md) — a briefing for an AI to describe Verity to humans (podcast / deck / talk)
+- [**Autonomy setup**](commands/verity/autonomy-setup.md) — `/verity:autonomy-setup`, the interview that generates your worker deployment
 
 ## Reference
 
 - **Package:** `verity-framework` · binaries `verity` + `verity-worker` · Node ≥16 · host deps `git`, `gh` (`verity doctor` checks them)
 - **Autonomy layer:** [docs/whats-different.md](docs/whats-different.md) — what the optional headless worker adds, and its guardrails
-- **Design docs:** [framework spec](docs/framework-spec.md) · [roles spec](docs/roles-spec.md) · [brand / positioning](docs/brand.md) · [walking-skeleton plan](docs/walking-skeleton-plan.md)
+- **Design docs:** [framework spec](docs/framework-spec.md) · [roles spec](docs/roles-spec.md)
 - **Contributing:** [`CONTRIBUTING.md`](CONTRIBUTING.md) — local setup, the test/lint checks, project layout, and conventions
 - **License:** MIT

@@ -1,10 +1,10 @@
 {"type":"thread.started","thread_id":"th_006","future_field":{"nested":true}}
 {"type":"session.hologram","payload":"from a future CLI"}
 {"type":"turn.started","novel_extra":42}
-{"type":"item.started","item":{"id":"item_0","item_type":"quantum_probe","status":"in_progress"}}
-{"type":"item.updated","item":{"id":"item_0","item_type":"quantum_probe","status":"still_going"}}
-{"type":"item.completed","item":{"id":"item_0","item_type":"quantum_probe","status":"completed"}}
-{"type":"item.started","item":{"id":"item_1","item_type":"command_execution","command":"ls","status":"in_progress"}}
-{"type":"item.completed","item":{"id":"item_1","item_type":"command_execution","command":"ls","exit_code":0,"status":"completed"}}
-{"type":"item.completed","item":{"id":"item_2","item_type":"agent_message","text":"All wrapped up, nothing structured to report."}}
+{"type":"item.started","item":{"id":"item_0","type":"quantum_probe","status":"in_progress"}}
+{"type":"item.updated","item":{"id":"item_0","type":"quantum_probe","status":"still_going"}}
+{"type":"item.completed","item":{"id":"item_0","type":"quantum_probe","status":"completed"}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"ls","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"All wrapped up, nothing structured to report."}}
 {"type":"turn.completed","usage":{"input_tokens":50,"cached_input_tokens":0,"output_tokens":25,"reasoning_output_tokens":0,"total_tokens":75},"bonus":"tolerated"}

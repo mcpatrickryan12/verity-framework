@@ -13,6 +13,11 @@ const stage = require('../verity/bin/lib/stage.cjs');
 const worker = require('../verity/worker/index.cjs');
 
 const WORKER = path.join(__dirname, '..', 'verity', 'worker', 'index.cjs');
+// The codex stub answers `--version` at the CURRENT pin, read rather than
+// hardcoded: stage 12 made `verity.codexMinVersion` feature-derived, so a
+// future evidence-driven bump must not fail every codex dispatch here on
+// preflight instead of exercising the worker.
+const MIN_CODEX = require('../package.json').verity.codexMinVersion;
 
 // --- stateful gh stub (PATH) -------------------------------------------------
 // Serves `issue list` / `pr list` (with --label / --state filtering for the
@@ -170,23 +175,40 @@ const CODEX_AGENT_STUB = `#!/usr/bin/env node
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 if (args.includes('--version')) {
-  process.stdout.write('codex-cli 0.42.0\\n');
+  process.stdout.write('codex-cli ${MIN_CODEX}\\n');
   process.exit(0);
 }
 if (args[0] === 'login') { process.stdout.write('Logged in\\n'); process.exit(0); }
-if (process.env.CODEX_ARGV_LOG) fs.appendFileSync(process.env.CODEX_ARGV_LOG, JSON.stringify(args) + '\\n');
+// Stage 11 (ADR-0011): the codex child's environment is CONSTRUCTED from a
+// passlist, so this stub's wiring travels through the workspace file the
+// fixture writes (the claude stub above still reads its own from the env).
+const path = require('node:path');
+const cwd = args[args.indexOf('--cd') + 1];
+const logDir = path.dirname(args[args.indexOf('--output-last-message') + 1]);
+const cfg = JSON.parse(fs.readFileSync(path.join(cwd, '.verity-stub.json'), 'utf8'));
+if (cfg.CODEX_ARGV_LOG) fs.appendFileSync(cfg.CODEX_ARGV_LOG, JSON.stringify(args) + '\\n');
 fs.readFileSync(0, 'utf8'); // consume the stdin prompt
-const queueFile = process.env.AGENT_QUEUE;
+const queueFile = cfg.AGENT_QUEUE;
 const queue = JSON.parse(fs.readFileSync(queueFile, 'utf8'));
 const step = queue.shift();
 fs.writeFileSync(queueFile, JSON.stringify(queue));
 if (!step) { process.stdout.write('agent queue exhausted\\n'); process.exit(1); }
 if (step.addIssues || step.addPrs) {
-  const s = JSON.parse(fs.readFileSync(process.env.GH_STATE_FILE, 'utf8'));
+  const s = JSON.parse(fs.readFileSync(cfg.GH_STATE_FILE, 'utf8'));
   s.issues = s.issues.concat(step.addIssues || []);
   s.prs = s.prs.concat(step.addPrs || []);
-  fs.writeFileSync(process.env.GH_STATE_FILE, JSON.stringify(s));
+  fs.writeFileSync(cfg.GH_STATE_FILE, JSON.stringify(s));
 }
+// Stage 14 (ADR-0011 tier 2): the adversarial half — writes the step scripts
+// into the workspace it was handed (--cd), then a LIVENESS MARKER beside the
+// run's transcripts. Marker present ⇒ the writes were attempted, so a later
+// "nothing propagated" reading is meaningful (issue #28).
+for (const w of step.writes || []) {
+  const target = path.join(cwd, w.path);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, w.text);
+}
+fs.writeFileSync(path.join(logDir, 'liveness.marker'), 'ran\\n');
 if (step.raw !== undefined) { process.stdout.write(step.raw); process.exit(0); }
 const lines = [
   { type: 'thread.started', thread_id: 't' },
@@ -220,6 +242,16 @@ function fixture(opts = {}) {
   const queueFile = path.join(dir, 'agent-queue.json');
   fs.writeFileSync(queueFile, JSON.stringify(opts.queue || []));
   const callsFile = path.join(dir, 'calls.jsonl');
+  // Wiring for the codex stub, delivered through the workspace (its
+  // environment is constructed since stage 11, ADR-0011).
+  fs.writeFileSync(
+    path.join(dir, '.verity-stub.json'),
+    JSON.stringify({
+      CODEX_ARGV_LOG: codexArgvLog,
+      AGENT_QUEUE: queueFile,
+      GH_STATE_FILE: stateFile,
+    }),
+  );
   if (opts.policy !== null) {
     fs.mkdirSync(path.join(dir, '.verity'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.verity', 'autonomy.yml'), opts.policy || POLICY_SUPERVISED);
@@ -227,12 +259,57 @@ function fixture(opts = {}) {
   for (const spec of opts.stages || []) {
     stage.create(dir, spec.title, spec.opts || {});
   }
+  // Stage 14: tier-2 containment is real worktree machinery, so its fixtures
+  // need a REAL repository — and the shaped workspace is derived from HEAD, so
+  // everything the role must see (including the stub's own wiring file) has to
+  // be committed, exactly as it would be in a worker's clean checkout.
+  // Stage 17 (ADR-0012): a codex role that produces git history needs a real
+  // PUSH TARGET too, so the fixture gets a real bare `origin`. The harness's own
+  // scratch (its $HOME, its stubs, its mutable state files) is gitignored: it
+  // lives inside the repo dir for convenience, it is NOT the role's work, and a
+  // Verity-performed commit must never sweep it up.
+  if (opts.git === true) {
+    fs.mkdirSync(path.join(dir, '.github', 'workflows'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.github', 'workflows', 'ci.yml'), 'name: ci\n');
+    fs.writeFileSync(
+      path.join(dir, '.gitignore'),
+      ['home/', 'origin.git/', 'stub-bin/', 'agent-stub', 'codex-agent-stub', ''].join('\n'),
+    );
+    for (const scratch of [
+      'gh-state.json',
+      'agent-queue.json',
+      'calls.jsonl',
+      'codex-argv.jsonl',
+    ]) {
+      fs.appendFileSync(path.join(dir, '.gitignore'), `${scratch}\n`);
+    }
+    const git = (args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+    git(['init', '-q']);
+    git(['config', 'user.email', 'verity@example.test']);
+    git(['config', 'user.name', 'Verity Test']);
+    git(['add', '-A']);
+    git(['commit', '-q', '-m', 'baseline']);
+    execFileSync('git', ['init', '-q', '--bare', path.join(dir, 'origin.git')], { stdio: 'pipe' });
+    git(['remote', 'add', 'origin', path.join(dir, 'origin.git')]);
+  }
   return { dir, home, bin, agent, codexAgent, codexArgvLog, stateFile, queueFile, callsFile };
+}
+
+// The issue-#28 gate: how many role invocations proved they actually ran. A
+// containment assertion built on "nothing happened" is INVALID without this.
+function livenessMarkers(fx) {
+  const logs = path.join(fx.home, '.verity', 'logs');
+  if (!fs.existsSync(logs)) {
+    return 0;
+  }
+  return fs
+    .readdirSync(logs)
+    .filter((run) => fs.existsSync(path.join(logs, run, 'liveness.marker'))).length;
 }
 
 // Env extras that point provider selection at the codex stub for one run.
 function codexEnv(fx) {
-  return { VERITY_CODEX_BIN: fx.codexAgent, CODEX_ARGV_LOG: fx.codexArgvLog };
+  return { VERITY_CODEX_BIN: fx.codexAgent };
 }
 
 function codexArgvs(fx) {
@@ -380,6 +457,101 @@ test('e2e: request → plan → build → gated-at-review posts EXACTLY the §7 
     'unlock comment carries outcome gated',
   );
   assert(!labels(state, 30).includes('verity:in-progress'), 'lock label released');
+});
+
+// --- stage 36: escalate verdict routing (kill-switch review.escalate_routing) -
+// Drives plan → build → review where the review reports a chosen verdict, and
+// asserts what lands on the ANCHOR (the request issue, #30) vs the PR (#114).
+function reviewVerdictFixture(verdict, policy) {
+  return fixture({
+    issues: [REQUEST_ISSUE],
+    stages: [{ title: 'Core' }],
+    policy,
+    queue: [
+      {
+        final: marker('success', { artifacts: { issues: [31] } }),
+        addIssues: [
+          { number: 31, title: '[stage 1] Core', state: 'OPEN', labels: [], assignees: [] },
+        ],
+      },
+      {
+        final: marker('success', { artifacts: { pr: 114 } }),
+        addPrs: [
+          {
+            number: 114,
+            title: '[stage 1] Core',
+            state: 'OPEN',
+            headRefName: 'feat/stage-1-core',
+            labels: [],
+            statusCheckRollup: [{ conclusion: 'SUCCESS' }],
+          },
+        ],
+      },
+      { final: marker('success', { artifacts: { pr: 114, verdict } }) },
+    ],
+  });
+}
+
+const ESCALATE_ON = `${POLICY_SUPERVISED}review:\n  escalate_routing: true\n`;
+
+test('e2e stage 36: flag ON — an escalate verdict gates AND parks the anchor with verity:needs-human, naming /verity:plan', () => {
+  const fx = reviewVerdictFixture('escalate', ESCALATE_ON);
+  const { code, stderr } = runWorker(fx);
+  assertEqual(code, 0, `escalate gates, exit 0 (stderr: ${stderr})`);
+  const state = ghState(fx);
+  // Parked: needs-human on the ANCHOR (work item), not the PR.
+  assert(labels(state, 30).includes('verity:needs-human'), 'anchor parked with needs-human');
+  assert(!labels(state, 114).includes('verity:needs-human'), 'the PR is not the parked item');
+  // The PR stays gated with the awaiting-approval label + findings.
+  assert(labels(state, 114).includes('verity:awaiting-approval'), 'PR still gated');
+  const summary = comments(state, 30).find((b) => b.startsWith('🤖'));
+  assert(summary.includes('gated at review:merge'), 'gated at the review gate');
+  assert(summary.includes('/verity:plan'), 'gate reason names the next role');
+  assert(summary.includes('verity:needs-human'), 'summary records the park');
+});
+
+test('e2e stage 36: flag OFF (default) — an escalate verdict routes EXACTLY as request_changes (gate, NO needs-human)', () => {
+  const fx = reviewVerdictFixture('escalate', POLICY_SUPERVISED);
+  const { code } = runWorker(fx);
+  assertEqual(code, 0, 'escalate gates at exit 0');
+  const state = ghState(fx);
+  assert(
+    !labels(state, 30).includes('verity:needs-human'),
+    'dark-launch: no needs-human when the flag is off',
+  );
+  assert(labels(state, 114).includes('verity:awaiting-approval'), 'plain gate on the PR');
+  const summary = comments(state, 30).find((b) => b.startsWith('🤖'));
+  assert(summary.includes('gated at review:merge'), 'gated like request_changes');
+  assert(!summary.includes('/verity:plan'), 'no next-role naming when the flag is off');
+});
+
+test('e2e stage 36: request_changes is unchanged — gates, NO needs-human (flag ON or OFF)', () => {
+  for (const policy of [POLICY_SUPERVISED, ESCALATE_ON]) {
+    const fx = reviewVerdictFixture('request_changes', policy);
+    const { code } = runWorker(fx);
+    assertEqual(code, 0, 'request_changes gates at exit 0');
+    const state = ghState(fx);
+    assert(
+      !labels(state, 30).includes('verity:needs-human'),
+      'request_changes never parks — regression guard',
+    );
+    const summary = comments(state, 30).find((b) => b.startsWith('🤖'));
+    assert(summary.includes('gated at review:merge'), 'request_changes gates');
+    assert(!summary.includes('/verity:plan'), 'request_changes does not name a next role');
+  }
+});
+
+test('e2e stage 36: fail-closed — an unknown verdict gates but does NOT park, even with the flag ON', () => {
+  const fx = reviewVerdictFixture('lgtm', ESCALATE_ON);
+  const { code } = runWorker(fx);
+  assertEqual(code, 0, 'unknown verdict gates at exit 0');
+  const state = ghState(fx);
+  assert(
+    !labels(state, 30).includes('verity:needs-human'),
+    'only an explicit escalate parks — an unknown verdict fails closed to a plain gate',
+  );
+  const summary = comments(state, 30).find((b) => b.startsWith('🤖'));
+  assert(summary.includes('gated at review:merge'), 'unknown verdict still gates');
 });
 
 // --- (b) token limit breaker -------------------------------------------------
@@ -793,7 +965,7 @@ test('gateNameFor: resolves the policy gate for a role, falls back to the role',
 // --- T11: usage ledger wiring + §4.1 daily-limit startup check ---------------------
 
 const USAGE_HEADER =
-  'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role';
+  'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate';
 // Pre-stage-3 header — seeded fixtures use it to prove old ledgers keep working.
 const LEGACY_USAGE_HEADER =
   'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome';
@@ -821,19 +993,22 @@ test('e2e: SUMMARIZE appends exactly one §3.4 usage.csv row for a zero-role run
     issues: [stageIssue({ labels: ['verity:ready', 'verity:awaiting-approval'] })],
     stages: [{ title: 'Core' }],
   });
-  const { code } = runWorker(fx); // gated immediately — no roles, est_usd null
+  const { code } = runWorker(fx); // gated immediately — no roles dispatched
   assertEqual(code, 0);
   const lines = readUsageCsv(fx);
   assert(lines !== null, '.verity/usage.csv was created');
   assertEqual(lines[0], USAGE_HEADER, 'header row required, exact §3.4 columns');
   assertEqual(lines.length, 2, 'exactly one data row for the run');
   const cells = lines[1].split(',');
-  assertEqual(cells.length, 11, '11 columns');
+  assertEqual(cells.length, 12, '12 columns');
   assert(!Number.isNaN(Date.parse(cells[0])), 'timestamp parses');
   assert(/^run-/.test(cells[1]), 'run_id');
   assertEqual(cells[2], 'octo/fixture', 'repo');
   assertEqual(cells[3], '', 'no roles ran');
-  assertEqual(cells[6], '', 'null est_usd → empty cell');
+  // Stage 30: zero provider dispatches ⇒ a VERIFIED $0 cell, never an
+  // unknown-cost '' (which the startup breaker reads as UNGATED unverifiable
+  // spend and wedges the rest of the UTC day on — canary run 5, defect N1).
+  assertEqual(cells[6], '0', 'zero dispatches → verified $0 cell');
   assertEqual(cells[8], 'gated', 'outcome');
   assertEqual(cells[9], '0', 'no invocations → zero tool_calls');
   assertEqual(cells[10], '', 'fallback row is unattributed (no role)');
@@ -920,6 +1095,41 @@ test('e2e: today’s est_usd >= max_usd_per_day → startup exit 30 daily-limit,
   assert(stderr.includes('max_usd_per_day 5'), 'message names the limit');
   assert(!fs.existsSync(fx.callsFile), 'fails BEFORE any gh call (no scan, no lock)');
   assertEqual(readUsageCsv(fx).length, 2, 'no new usage row for a refused start');
+});
+
+// Stage 18 (#51, ADR-0008): the same startup check, on a ledger whose costs
+// are unverifiable. Before the fix the empty est_usd cell summed to $0 and the
+// worker started as if the day were free.
+test('e2e: today’s unknown-cost runs → startup exit 30 unknown-cost-budget, not a silent pass', () => {
+  const fx = fixture({
+    issues: [REQUEST_ISSUE],
+    stages: [{ title: 'Core' }],
+    policy: `${POLICY_SUPERVISED}limits:\n  max_usd_per_day: 5\n`,
+  });
+  seedUsageCsv(fx, [
+    `${new Date().toISOString()},run-prev,octo/fixture,build,193745,2436,,93,success,7,build`,
+  ]);
+  const { code, stderr } = runWorker(fx);
+  assertEqual(code, 30, 'an unverifiable budget refuses the start');
+  assertErrorLine(stderr, 30, 'unknown-cost-budget');
+  assert(stderr.includes('1 run'), 'message names how many runs were unverifiable');
+  assert(!fs.existsSync(fx.callsFile), 'fails BEFORE any gh call (no scan, no lock)');
+});
+
+test('e2e: unknown_cost_behavior allow_with_token_limit → the start proceeds, but says the USD breaker is inert', () => {
+  const fx = fixture({
+    issues: [REQUEST_ISSUE],
+    stages: [{ title: 'Core' }],
+    policy: `${POLICY_SUPERVISED}limits:\n  max_usd_per_day: 5\n  unknown_cost_behavior: allow_with_token_limit\n`,
+  });
+  seedUsageCsv(fx, [
+    `${new Date().toISOString()},run-prev,octo/fixture,build,193745,2436,,93,success,7,build`,
+  ]);
+  const { stderr } = runWorker(fx);
+  assert(!stderr.includes('unknown-cost-budget'), 'the startup check does not refuse the start');
+  assert(fs.existsSync(fx.callsFile), 'the run got past startup and scanned');
+  assert(stderr.includes('USD breaker inert by consent'), 'the operator is told, not reassured');
+  assert(stderr.includes('allow_with_token_limit'), 'and told which knob made it so');
 });
 
 test('e2e: today’s runs >= max_runs_per_day → startup exit 30 daily-limit', () => {
@@ -1070,7 +1280,17 @@ test('e2e: all §4.1 checks pass → worker proceeds to scan (idle), checks firs
 
 // --- stage 9: worker provider selection (ADR-0005/0007/0008/0009) -------------
 
-const POLICY_CODEX = ['mode: supervised', 'agent:', '  provider: codex', ''].join('\n');
+// The packaged roles declare `network: false`, which no exec-path mechanism
+// enforces — a codex worker policy must acknowledge that gap explicitly or
+// every dispatch is refused (ADR-0011 capability honesty rule; the refusal is
+// proven in tests/enforcement.test.cjs).
+const POLICY_CODEX = [
+  'mode: supervised',
+  'agent:',
+  '  provider: codex',
+  '  acknowledged_enforcement_gaps: [network]',
+  '',
+].join('\n');
 
 // The PR fixture the codex pipeline test's build step opens (green checks).
 const CODEX_PR = {
@@ -1091,6 +1311,10 @@ const CODEX_PR = {
 // behavior has its own test below.
 test('pipeline: supervised trust-0 codex run — plan → build → gated at review, gates observed', () => {
   const fx = fixture({
+    // Stage 17 (ADR-0012): a REAL repository with a REAL origin. The build role
+    // holds git_write, which under codex means Verity performs its git — and a
+    // grant Verity cannot provide refuses the run rather than pretending.
+    git: true,
     issues: [REQUEST_ISSUE],
     stages: [{ title: 'Core' }],
     policy: `${POLICY_CODEX}limits:\n  unknown_cost_behavior: allow_with_token_limit\nnotify:\n  mention: [seanerama]\n`,
@@ -1198,6 +1422,122 @@ test('e2e: allow_with_token_limit proceeds — codex tokens count toward max_tok
   assert(summary.includes('roles: plan'), 'one role ran before the breaker');
 });
 
+// --- stage 21 (#58): the unknown-cost gate must be approvable ------------------
+// Stage 18's daily breaker refused at startup BEFORE the P1 approved-resume
+// path ran, so the unknown-cost gate comment's `approve:` instruction was
+// false: under the DEFAULT policy (max_usd_per_day 25.0) every codex worker
+// wedged permanently after its first run. ADR-0008 prices 'gate' at ONE human
+// approval PER RUN — the single-use `verity:approved` token IS that approval,
+// so it must let exactly one run past the breaker's unknown-cost refusal.
+
+// The operator does exactly what the gate comment says: applies the label.
+function approve(fx, number) {
+  const s = ghState(fx);
+  const it = s.issues.concat(s.prs).find((i) => i.number === number);
+  it.labels = (it.labels || []).concat(['verity:approved']);
+  fs.writeFileSync(fx.stateFile, JSON.stringify(s));
+}
+
+test('e2e regression (stage 21): a run gated at unknown-cost, then approved, PROCEEDS on the next tick under the default policy', () => {
+  const fx = fixture({
+    git: true, // tick 2 dispatches build, whose git_write means Verity performs git (ADR-0012)
+    issues: [REQUEST_ISSUE],
+    stages: [{ title: 'Core' }],
+    // No limits override: max_usd_per_day 25.0 + unknown_cost_behavior gate —
+    // exactly the DEFAULTS every new codex operator gets (autonomy.cjs).
+    policy: `${POLICY_CODEX}notify:\n  mention: [seanerama]\n`,
+    queue: [
+      {
+        final: marker('success', { artifacts: { issues: [31] } }),
+        addIssues: [
+          { number: 31, title: '[stage 1] Core', state: 'OPEN', labels: [], assignees: [] },
+        ],
+      },
+      { final: marker('success') }, // tick 2's role — codex again, cost unknown again
+    ],
+  });
+
+  // Tick 1: pauses at the unknown-cost gate and posts the approve: instruction.
+  const tick1 = runWorker(fx, { env: codexEnv(fx) });
+  assertEqual(tick1.code, 0, `tick 1 gates, exit 0 (stderr: ${tick1.stderr})`);
+  assert(labels(ghState(fx), 30).includes('verity:awaiting-approval'), 'tick 1 parked at the gate');
+
+  approve(fx, 30);
+
+  // Tick 2: before the fix this refused at startup — exit 30 unknown-cost-budget,
+  // no gh call, no model run — and the approval was a permanent no-op.
+  const tick2 = runWorker(fx, { env: codexEnv(fx) });
+  assertEqual(tick2.code, 0, `tick 2 proceeds on the approval (stderr: ${tick2.stderr})`);
+  assertEqual(codexArgvs(fx).length, 2, 'tick 2 actually dispatched a model run');
+
+  const state = ghState(fx);
+  assert(!labels(state, 30).includes('verity:approved'), 'the single-use token was consumed');
+  // Consent is RECORDED, not implied: the run's own §7 summary carries the
+  // consumed approval in its outcome. (The startup warn naming the token is
+  // unobservable here — the harness discards stderr on exit-0 runs.)
+  const summaries = comments(state, 30).filter((b) => b.startsWith('🤖'));
+  assertEqual(summaries.length, 2, 'each tick posted its §7 summary');
+  assert(
+    summaries[1].includes('budget:') && summaries[1].includes('verity:approved'),
+    `tick 2 summary records the consumed budget approval, got: ${summaries[1]}`,
+  );
+  assert(
+    summaries[1].includes('this run only'),
+    'the summary states the single-run scope of the consumed approval',
+  );
+
+  // Scope: the approval covered THAT run only — tick 2's own unverifiable run
+  // gated again rather than inheriting a standing waiver.
+  assert(summaries[1].includes('— ⏸️ gated'), 'tick 2 ended gated again');
+  assert(summaries[1].includes(worker.UNKNOWN_COST_GATE), 'at the unknown-cost gate again');
+
+  // Tick 3, no fresh approval: the breaker still refuses — single-use, not a
+  // standing waiver, and an UNAPPROVED unverifiable run still never proceeds.
+  const tick3 = runWorker(fx, { env: codexEnv(fx) });
+  assertEqual(tick3.code, 30, 'tick 3 refuses without a fresh approval');
+  assertErrorLine(tick3.stderr, 30, 'unknown-cost-budget');
+});
+
+test('e2e (stage 21): a VERIFIED overspend still trips daily-limit — an approval never masks it', () => {
+  const fx = fixture({
+    issues: [
+      stageIssue({ labels: ['verity:ready', 'verity:awaiting-approval', 'verity:approved'] }),
+    ],
+    stages: [{ title: 'Core' }],
+    policy: `${POLICY_CODEX}notify:\n  mention: [seanerama]\n`, // default max_usd_per_day 25.0
+  });
+  // Today's VERIFIED spend already exceeds the ceiling; an approval is present.
+  seedUsageCsv(fx, [
+    `${new Date().toISOString()},run-prev,octo/fixture,build,193745,2436,30.00,93,success`,
+  ]);
+  const { code, stderr } = runWorker(fx, { env: codexEnv(fx) });
+  assertEqual(code, 30, 'verified overspend refuses the start, approval or not');
+  assertErrorLine(stderr, 30, 'daily-limit');
+  assert(!fs.existsSync(fx.callsFile), 'still refused BEFORE any gh call');
+});
+
+test('e2e (stage 21): claude, which reports real costs, is unaffected — no waiver, no budget note', () => {
+  const fx = fixture({
+    issues: [
+      stageIssue({ labels: ['verity:ready', 'verity:awaiting-approval', 'verity:approved'] }),
+    ],
+    stages: [{ title: 'Core' }],
+    policy: `${POLICY_SUPERVISED}limits:\n  max_chained_roles: 1\n`,
+    queue: [{ final: marker('success') }],
+  });
+  // Yesterday's claude ledger habits: every row carries a real cost.
+  seedUsageCsv(fx, [
+    `${new Date().toISOString()},run-prev,octo/fixture,plan,100,10,1.00,60,success`,
+  ]);
+  const { code, stderr } = runWorker(fx);
+  assertEqual(code, 0, `claude P1 run proceeds as it always has (stderr: ${stderr})`);
+  assert(!stderr.includes('cannot be verified'), 'no unverifiable-budget warning');
+  assert(!stderr.includes('verity:approved on'), 'no budget-waiver consumption note');
+  const summary = comments(ghState(fx), 41).find((b) => b.startsWith('🤖'));
+  assert(summary !== undefined, 'summary posted');
+  assert(!summary.includes('budget:'), 'no budget-approval line on a verified-cost run');
+});
+
 test('e2e: a policy without an agent block stays Claude-backed — codex never invoked', () => {
   const fx = fixture({
     issues: [REQUEST_ISSUE],
@@ -1265,6 +1605,7 @@ test('e2e: policy sandbox override MAY narrow — read-only reaches the codex ar
       'agent:',
       '  provider: codex',
       '  sandbox: read-only',
+      '  acknowledged_enforcement_gaps: [network]',
       'limits:',
       '  unknown_cost_behavior: allow_with_token_limit',
       '  max_chained_roles: 1',
@@ -1281,6 +1622,175 @@ test('e2e: policy sandbox override MAY narrow — read-only reaches the codex ar
     'read-only',
     'the NARROWED sandbox reached the provider (plan role ships workspace-write)',
   );
+});
+
+// --- stage 14: ADR-0011 tier-2 containment gating -----------------------------
+
+// Tier 2 = a disposable shaped workspace + gated merge-back. Tier 1 (the
+// default) catches a containment violation only AFTER it happened, which is
+// adequate for supervised/trust-0 and not adequate for autonomy.
+const POLICY_CODEX_TIER2 = [
+  'mode: supervised',
+  'agent:',
+  '  provider: codex',
+  '  acknowledged_enforcement_gaps: [network]',
+  '  containment_tier: 2',
+  '',
+].join('\n');
+
+// PIPELINE TEST (the stage's exit proof) — one SUPERVISED worker run under
+// tier 2 in a throwaway REAL repository, proving that a protected-path write
+// performed inside the disposable workspace never reaches the real repository,
+// while the same run's in-policy work does propagate. The role stub writes a
+// liveness marker in the same invocation (issue #28): "nothing propagated"
+// means nothing unless the writes were actually attempted.
+test('pipeline: supervised codex run under TIER 2 — a protected-path write in the workspace never reaches the repo', () => {
+  const fx = fixture({
+    git: true,
+    issues: [REQUEST_ISSUE],
+    stages: [{ title: 'Core' }],
+    policy: `${POLICY_CODEX_TIER2}limits:\n  unknown_cost_behavior: allow_with_token_limit\nnotify:\n  mention: [seanerama]\n`,
+    queue: [
+      {
+        // plan: ordinary, in-policy work — this MUST propagate.
+        final: marker('success', { artifacts: { issues: [31] } }),
+        writes: [{ path: 'docs/plan-notes.md', text: '# planned\n' }],
+        addIssues: [
+          { number: 31, title: '[stage 1] Core', state: 'OPEN', labels: [], assignees: [] },
+        ],
+      },
+      {
+        // build: the adversary. `.github/` exists only inside the workspace,
+        // so the write SUCCEEDS there — and is stopped at propagation time.
+        final: marker('success', { artifacts: { pr: 114 } }),
+        writes: [
+          { path: '.github/workflows/pwn.yml', text: 'on: push\n' },
+          { path: '.github/workflows/ci.yml', text: 'name: tampered\n' },
+        ],
+        addPrs: [CODEX_PR],
+      },
+    ],
+  });
+  const { code, stderr } = runWorker(fx, { env: codexEnv(fx) });
+
+  // Both roles actually ran — without this the containment reading below is an
+  // INVALID TEST, never a pass (issue #28 / spike F4).
+  assertEqual(livenessMarkers(fx), 1, 'the run invoked its roles (one log dir per run)');
+  assertEqual(codexArgvs(fx).length, 2, 'plan then build, both through the codex driver');
+
+  // The gate turned the build role's claimed success into a loud failure.
+  assertEqual(code, 20, `a rejected path fails the run (stderr: ${stderr})`);
+  assert(stderr.includes('verity-worker: 20 role-failed-once:'), '§8.2 stderr line');
+  const summary = comments(ghState(fx), 30).find((b) => b.startsWith('🤖'));
+  assert(summary.includes('— ⚠️ failed_once'), 'the run outcome is a failure (strike 1)');
+  assert(summary.includes('role build failed'), 'and names the role');
+  assert(summary.includes('.github/workflows/pwn.yml'), 'and the path that was rejected');
+
+  // THE PROOF: the real repository never saw either protected-path write.
+  assert(
+    !fs.existsSync(path.join(fx.dir, '.github', 'workflows', 'pwn.yml')),
+    'the created workflow never reached the real repository',
+  );
+  assertEqual(
+    fs.readFileSync(path.join(fx.dir, '.github', 'workflows', 'ci.yml'), 'utf8'),
+    'name: ci\n',
+    'nor did the tampering with an existing workflow',
+  );
+  // ...while the earlier role's in-policy work DID propagate, so the guarantee
+  // is a gate, not a wholesale refusal to let anything through.
+  assertEqual(
+    fs.readFileSync(path.join(fx.dir, 'docs', 'plan-notes.md'), 'utf8'),
+    '# planned\n',
+    'the allowed change propagated back from the disposable workspace',
+  );
+
+  // Every role really did run in a disposable workspace under the Verity state
+  // root — never in the real checkout, never under TMPDIR (spike F5).
+  const wsRoot = path.join(fx.home, '.verity', 'workspaces');
+  for (const argv of codexArgvs(fx)) {
+    const cd = argv[argv.indexOf('--cd') + 1];
+    assert(cd.startsWith(wsRoot), `--cd pointed at a shaped workspace, got ${cd}`);
+    assert(cd !== fx.dir, 'and never at the real checkout');
+  }
+  // Disposed on success AND on the failing role alike.
+  assertEqual(
+    fs.existsSync(wsRoot) ? fs.readdirSync(path.join(wsRoot, fs.readdirSync(wsRoot)[0])).length : 0,
+    0,
+    'no workspace survives the run',
+  );
+  assertEqual(mergeCalls(fx).length, 0, 'trust 0 never merges');
+});
+
+test('tier gating: UNATTENDED codex autonomy is refused below tier 2 — before any gh call', () => {
+  const fx = fixture({
+    issues: [REQUEST_ISSUE],
+    policy:
+      'mode: autonomous\nagent:\n  provider: codex\n  acknowledged_enforcement_gaps: [network]\n',
+  });
+  const { code, stderr } = runWorker(fx, { env: codexEnv(fx) });
+  assertEqual(code, 30, 'unattended codex without tier 2 exits 30');
+  assertErrorLine(stderr, 30, 'containment-tier-required');
+  assert(stderr.includes('agent.containment_tier: 2'), 'names the way to enable it');
+  assert(stderr.includes("mode 'supervised'"), 'and the supervised alternative');
+  assert(!fs.existsSync(fx.callsFile), 'no gh call — refused before ANY mutation or scan');
+  assertEqual(codexArgvs(fx).length, 0, 'and the agent was never invoked');
+});
+
+test('tier gating: SUPERVISED codex at tier 1 still runs; tier 2 permits autonomous', () => {
+  // Supervised at tier 1 is explicitly allowed by ADR-0011 — the tier gate must
+  // not become a blanket codex refusal.
+  const supervised = fixture({
+    policy: `${POLICY_CODEX}limits:\n  unknown_cost_behavior: allow_with_token_limit\n`,
+  });
+  assertEqual(runWorker(supervised, { env: codexEnv(supervised) }).code, 0, 'supervised runs');
+
+  // Autonomous WITH tier 2 gets past the gate (no eligible work → idle).
+  const auto = fixture({
+    policy:
+      'mode: autonomous\nagent:\n  provider: codex\n  acknowledged_enforcement_gaps: [network]\n  containment_tier: 2\n',
+  });
+  const res = runWorker(auto, { env: codexEnv(auto) });
+  assertEqual(res.code, 0, `autonomous at tier 2 is permitted (stderr: ${res.stderr})`);
+  assert(!res.stderr.includes('containment-tier-required'), 'the gate did not fire');
+
+  // Claude is unaffected: it has no containment tiers at all.
+  const claude = fixture({ policy: 'mode: autonomous\n' });
+  const claudeRes = runWorker(claude);
+  assertEqual(claudeRes.code, 0, `claude autonomy is untouched (stderr: ${claudeRes.stderr})`);
+});
+
+test('assertContainmentTier: unit — the exact matrix, fail closed', () => {
+  const cfg = (agent) => worker.resolveEffectiveAgent({ agent });
+  const refuses = (mode, agent) => {
+    try {
+      worker.assertContainmentTier({ mode }, cfg(agent));
+      return null;
+    } catch (err) {
+      return err.slug;
+    }
+  };
+  assertEqual(
+    refuses('autonomous', { provider: 'codex' }),
+    'containment-tier-required',
+    'unattended codex at the DEFAULT tier is refused (absence never grants)',
+  );
+  assertEqual(
+    refuses('autonomous', { provider: 'codex', containment_tier: 1 }),
+    'containment-tier-required',
+  );
+  assertEqual(
+    refuses('autonomous', { provider: 'codex', containment_tier: 2 }),
+    null,
+    'tier 2 permits',
+  );
+  assertEqual(
+    refuses('supervised', { provider: 'codex' }),
+    null,
+    'supervised is allowed at tier 1',
+  );
+  assertEqual(refuses('autonomous', { provider: 'claude' }), null, 'claude has no tiers');
+  assertEqual(refuses('autonomous', {}), null, 'a pre-stage-9 policy is claude-backed');
+  assertEqual(worker.resolveEffectiveAgent({}).containment_tier, 1, 'the default tier is 1');
 });
 
 // One immutable effective config per run (in-process, agentExec/next patched):
@@ -1356,6 +1866,7 @@ test('runLoop: one immutable agent config per run; --timeout-secs shrinks across
       assertEqual(c.flags.approval, 'never', `${c.role}: approval propagated`);
       assertEqual(c.flags['run-id'], 'run-immutable', `${c.role}: one transcript destination`);
       assert(Number.isInteger(c.flags['timeout-secs']), `${c.role}: integer deadline`);
+      assert(!('containment-tier' in c.flags), `${c.role}: tier 1 policy stays omitted-in`);
     }
     assert(
       calls[0].flags['timeout-secs'] <= policy.limits.max_wall_clock_min * 60,
@@ -1414,7 +1925,59 @@ test('runLoop: a claude-default policy dispatches agent claude with NO codex kno
     assert(!('model' in calls[0].flags), 'null model is omitted, not passed');
     assert(!('sandbox' in calls[0].flags), 'null sandbox is omitted');
     assert(!('approval' in calls[0].flags), 'null approval is omitted');
+    assert(
+      !('containment-tier' in calls[0].flags),
+      'tier 1 is omitted-in — a pre-stage-14 policy dispatches byte-identically',
+    );
     assert(Number.isInteger(calls[0].flags['timeout-secs']), 'deadline still enforced (ADR-0008)');
+  } finally {
+    agentExecMod.dispatch = origDispatch;
+    nextMod.dispatch = origNext;
+  }
+});
+
+test('runLoop: containment_tier 2 reaches EVERY chained dispatch as --containment-tier', () => {
+  const agentExecMod = require('../verity/bin/lib/agent-exec.cjs');
+  const nextMod = require('../verity/bin/lib/next.cjs');
+  const autonomyMod = require('../verity/bin/lib/autonomy.cjs');
+  const policy = JSON.parse(JSON.stringify(autonomyMod.DEFAULTS));
+  policy.mode = 'supervised';
+  policy.agent = { ...policy.agent, provider: 'codex', containment_tier: 2 };
+  policy.limits.unknown_cost_behavior = 'allow_with_token_limit';
+  const calls = [];
+  const origDispatch = agentExecMod.dispatch;
+  const origNext = nextMod.dispatch;
+  agentExecMod.dispatch = (args, flags) => {
+    calls.push({ ...flags });
+    return {
+      schema: 1,
+      role: args[0],
+      outcome: 'gated',
+      tokens: { in: 1, out: 1 },
+      est_usd: null,
+      wall_secs: 1,
+      tool_calls: 0,
+      artifacts: {},
+      error: null,
+    };
+  };
+  nextMod.dispatch = () => ({
+    schema: 1,
+    action: 'work',
+    role: 'build',
+    args: ['31'],
+    gate: null,
+    target: { kind: 'stage', number: null },
+    reason: 'stage ready',
+  });
+  try {
+    worker.runLoop(
+      { repo: 'o/r', cwd: '/tmp', stdout() {}, stderr() {} },
+      { policy, runId: 'run-tier2', item: { kind: 'stage', number: null, tier: 'P5' } },
+    );
+    assertEqual(calls.length, 1);
+    assertEqual(calls[0]['containment-tier'], 2, 'the tier travels with the run config');
+    assertEqual(calls[0].agent, 'codex');
   } finally {
     agentExecMod.dispatch = origDispatch;
     nextMod.dispatch = origNext;
@@ -1475,4 +2038,489 @@ test('recordUsage: ledger errors are logged, never thrown (run outcome unchanged
     warnings.some((l) => l.includes('failed to record usage')),
     'append failure logged as a warning',
   );
+});
+
+// --- Stage 32: a refused P1 run must not consume the approval or strip the gate ---
+//
+// runLoop consumed a P1 item's single-use token (verity:approved) AND the gate
+// announcement (verity:awaiting-approval) at the TOP of the loop, before any
+// work. A run that then REFUSED before doing any real work — a `state:unverified`
+// pre-dispatch gate, or a pre-SPAWN infra refusal like `unenforceable-policy`
+// (agent-exec exit 30, ZERO provider spawns) — had already burned the operator's
+// approval and erased the visible pause. The fix makes consumption
+// effect-conditional: the labels come off exactly ONCE, only when the run
+// actually reaches the work the approval authorized (a dispatch that genuinely
+// spawned, or a stage-31 parked-result resume). A pre-work refusal leaves BOTH
+// labels exactly as it found them.
+//
+// The pre-work-vs-mid-work discriminator is the stage-30 signal already frozen
+// in contracts/agent-result.md: a spawn-free refusal reports a VERIFIED
+// est_usd:0, while an infra error AFTER the model ran keeps est_usd:null
+// (unknown, ADR-0008). So `infra_error && est_usd === 0` is the only
+// non-consuming dispatch outcome; every other outcome consumes.
+//
+// These drive runLoop directly (like the config tests above), patching next +
+// agent-exec for the dispatch decision/result and gh.run to observe the exact
+// label DELETE/POST calls the worker makes.
+function patchLabelOps(initial) {
+  const ghMod = require('../verity/bin/lib/gh.cjs');
+  const locksMod = require('../verity/bin/lib/locks.cjs');
+  const origRun = ghMod.run;
+  const origReadComments = locksMod.readComments;
+  const state = { labels: new Set(initial), deletes: 0, adds: 0, gateComments: 0 };
+  ghMod.run = (args) => {
+    const xi = args.indexOf('-X');
+    const method = xi === -1 ? 'GET' : args[xi + 1];
+    const last = args[args.length - 1];
+    if (args[0] === 'api' && method === 'DELETE') {
+      const m = /\/labels\/(.+)$/.exec(last);
+      if (m) {
+        state.deletes += 1;
+        state.labels.delete(decodeURIComponent(m[1]));
+      }
+      return '';
+    }
+    if (args[0] === 'api' && method === 'POST' && typeof last === 'string') {
+      if (last.startsWith('labels[]=')) {
+        state.adds += 1;
+        state.labels.add(last.slice('labels[]='.length));
+      } else if (last.startsWith('body=') && last.includes('paused at human gate')) {
+        state.gateComments += 1;
+      }
+      return '';
+    }
+    return '';
+  };
+  // No parked pointer in these scenarios — the trail read must be a clean empty.
+  locksMod.readComments = () => [];
+  state.restore = () => {
+    ghMod.run = origRun;
+    locksMod.readComments = origReadComments;
+  };
+  return state;
+}
+
+function p1Policy() {
+  const autonomyMod = require('../verity/bin/lib/autonomy.cjs');
+  const policy = JSON.parse(JSON.stringify(autonomyMod.DEFAULTS));
+  policy.mode = 'supervised';
+  return policy;
+}
+
+const P1_ITEM = { kind: 'issue', number: 50, tier: 'P1' };
+const RESULT = (o) => ({
+  schema: 1,
+  role: o.role || 'build',
+  outcome: o.outcome,
+  tokens: o.tokens || { in: 10, out: 5 },
+  est_usd: 'est_usd' in o ? o.est_usd : null,
+  wall_secs: 1,
+  tool_calls: 0,
+  artifacts: o.artifacts || {},
+  error: o.error || null,
+});
+const WORK = (role, number) => ({
+  schema: 1,
+  action: 'work',
+  role,
+  args: [String(number)],
+  gate: null,
+  target: { kind: 'issue', number },
+  reason: 'stage ready',
+});
+const IDLE = {
+  schema: 1,
+  action: 'idle',
+  role: null,
+  args: [],
+  gate: null,
+  target: null,
+  reason: 'no work',
+};
+
+function runP1(dispatchResults, planQueue) {
+  const agentExecMod = require('../verity/bin/lib/agent-exec.cjs');
+  const nextMod = require('../verity/bin/lib/next.cjs');
+  const origDispatch = agentExecMod.dispatch;
+  const origNext = nextMod.dispatch;
+  const dispatches = [];
+  let di = 0;
+  let pi = 0;
+  agentExecMod.dispatch = (args, flags) => {
+    dispatches.push({ role: args[0], flags });
+    const r = dispatchResults[di];
+    di += 1;
+    return typeof r === 'function' ? r(args) : r;
+  };
+  nextMod.dispatch = () => {
+    const p = planQueue[Math.min(pi, planQueue.length - 1)];
+    pi += 1;
+    return p;
+  };
+  try {
+    const summary = worker.runLoop(
+      { repo: 'o/r', cwd: '/tmp', stdout() {}, stderr() {} },
+      { policy: p1Policy(), runId: 'run-stage32', item: { ...P1_ITEM } },
+    );
+    return { summary, dispatches };
+  } finally {
+    agentExecMod.dispatch = origDispatch;
+    nextMod.dispatch = origNext;
+  }
+}
+
+test('stage 32: a P1 pre-spawn infra refusal (unenforceable-policy, est_usd 0) leaves verity:approved AND verity:awaiting-approval intact', () => {
+  const labels = patchLabelOps(['verity:approved', 'verity:awaiting-approval']);
+  try {
+    const { summary, dispatches } = runP1(
+      [
+        RESULT({
+          outcome: 'infra_error',
+          est_usd: 0,
+          error: 'unenforceable-policy: network: false',
+        }),
+      ],
+      [WORK('build', 31)],
+    );
+    assertEqual(summary.outcome, 'infra', 'the pre-spawn refusal is surfaced as infra');
+    assertEqual(dispatches.length, 1, 'the dispatch was attempted (the refusal comes FROM it)');
+    assert(
+      labels.labels.has('verity:approved'),
+      'the single-use approval survives a refusal that spawned nothing',
+    );
+    assert(
+      labels.labels.has('verity:awaiting-approval'),
+      'the gate announcement survives too — nothing to re-announce next tick',
+    );
+    assertEqual(labels.deletes, 0, 'no label was removed on a pre-work refusal');
+  } finally {
+    labels.restore();
+  }
+});
+
+test('stage 32: a P1 state:unverified pre-dispatch gate leaves both labels intact and never dispatches', () => {
+  const labels = patchLabelOps(['verity:approved', 'verity:awaiting-approval']);
+  const nextMod = require('../verity/bin/lib/next.cjs');
+  try {
+    const { summary, dispatches } = runP1(
+      [], // dispatch must never be reached
+      [
+        {
+          schema: 1,
+          action: 'gated',
+          role: null,
+          args: [],
+          gate: nextMod.STATE_GATE,
+          target: null,
+          reason: 'GitHub unreadable',
+        },
+      ],
+    );
+    assertEqual(summary.outcome, 'infra', 'the STATE_GATE refusal is infra');
+    assertEqual(dispatches.length, 0, 'zero dispatches — the refusal precedes all work');
+    assert(labels.labels.has('verity:approved'), 'approval preserved across the state refusal');
+    assert(labels.labels.has('verity:awaiting-approval'), 'gate announcement preserved');
+    assertEqual(labels.deletes, 0, 'no label removed');
+    assertEqual(labels.gateComments, 0, 'no new gate comment — nothing to re-announce (stage 27)');
+  } finally {
+    labels.restore();
+  }
+});
+
+test('stage 32: a healthy chained P1 run consumes BOTH labels exactly once', () => {
+  const labels = patchLabelOps(['verity:approved', 'verity:awaiting-approval']);
+  try {
+    const { summary, dispatches } = runP1(
+      [
+        RESULT({ role: 'build', outcome: 'success', est_usd: 0.5 }),
+        RESULT({ role: 'build', outcome: 'success', est_usd: 0.5 }),
+      ],
+      [WORK('build', 31), WORK('build', 32), IDLE],
+    );
+    assertEqual(summary.outcome, 'success', 'the chain ran to idle');
+    assertEqual(dispatches.length, 2, 'two chained dispatches');
+    assert(!labels.labels.has('verity:approved'), 'the approval was consumed');
+    assert(!labels.labels.has('verity:awaiting-approval'), 'the gate label came off with it');
+    assertEqual(
+      labels.deletes,
+      2,
+      'exactly ONE consumption (approved + gate) across the whole multi-role run',
+    );
+  } finally {
+    labels.restore();
+  }
+});
+
+test('stage 32: a P1 dispatch that SPAWNED and then infra-errored (est_usd null) still consumes — only pre-work refusals are protected', () => {
+  const labels = patchLabelOps(['verity:approved', 'verity:awaiting-approval']);
+  try {
+    const { summary, dispatches } = runP1(
+      [
+        RESULT({
+          outcome: 'infra_error',
+          est_usd: null,
+          error: 'malformed-output after the model ran',
+        }),
+      ],
+      [WORK('build', 31)],
+    );
+    assertEqual(summary.outcome, 'infra', 'a mid-run infra crash is still infra');
+    assertEqual(dispatches.length, 1, 'the dispatch ran');
+    assert(
+      !labels.labels.has('verity:approved'),
+      'a crash mid-work still consumes — the model ran (est_usd null = unknown, not verified $0)',
+    );
+    assert(!labels.labels.has('verity:awaiting-approval'), 'and the gate label with it');
+    assertEqual(labels.deletes, 2, 'the single consumption happened');
+  } finally {
+    labels.restore();
+  }
+});
+
+// --- Stage 37: a post-dispatch park announces on the just-opened PR when the ---
+// stage has no work-item issue (canary run 6, finding N1) --------------------
+//
+// `gateTarget` is null for a stage dispatch whose stage carries no work-item
+// issue (a non-lockable anchor). `gatePause` silently skips a null target — so
+// a build that opened a PR THIS run and then parked at the unknown-cost gate
+// left the operator an open PR, a ledgered unknown-cost run, and NOTHING to
+// approve (the day wedges). The three POST-dispatch parks now target
+// `gateTarget ?? lastPr`, landing the label + comment (+ the stage-31 parked
+// pointer) on the just-opened PR. The pre-dispatch plan-gate keeps `gateTarget`
+// (a stale prior-iteration PR there would mislabel), and review:merge already
+// did its own `pr ?? gateTarget`.
+//
+// These drive runLoop directly (like the stage-32 tests above), patching next +
+// agent-exec for the decision/result and gh.run/gh.json to observe the exact
+// target every label/comment lands on.
+function patchTargetedPosts() {
+  const ghMod = require('../verity/bin/lib/gh.cjs');
+  const locksMod = require('../verity/bin/lib/locks.cjs');
+  const origRun = ghMod.run;
+  const origJson = ghMod.json;
+  const origReadComments = locksMod.readComments;
+  const posts = []; // { target, kind: 'label'|'comment', value }
+  ghMod.run = (args) => {
+    const xi = args.indexOf('-X');
+    const method = xi === -1 ? 'GET' : args[xi + 1];
+    const url = args.find((a) => typeof a === 'string' && a.startsWith('repos/'));
+    const m = /issues\/(\d+)\/(labels|comments)$/.exec(url || '');
+    if (args[0] === 'api' && method === 'POST' && m) {
+      const target = Number(m[1]);
+      const last = args[args.length - 1];
+      if (m[2] === 'labels' && typeof last === 'string' && last.startsWith('labels[]=')) {
+        posts.push({ target, kind: 'label', value: last.slice('labels[]='.length) });
+      } else if (m[2] === 'comments' && typeof last === 'string' && last.startsWith('body=')) {
+        posts.push({ target, kind: 'comment', value: last.slice('body='.length) });
+      }
+    }
+    return '';
+  };
+  // parkedResultPointer reads the PR head SHA to anchor the parked pointer.
+  ghMod.json = (args) =>
+    args[0] === 'pr' && args[1] === 'view' ? { headRefOid: 'a1b2c3d4e5f6a1b2' } : {};
+  locksMod.readComments = () => [];
+  return {
+    posts,
+    labelsOn(target) {
+      return posts.filter((p) => p.kind === 'label' && p.target === target).map((p) => p.value);
+    },
+    commentsOn(target) {
+      return posts.filter((p) => p.kind === 'comment' && p.target === target).map((p) => p.value);
+    },
+    restore() {
+      ghMod.run = origRun;
+      ghMod.json = origJson;
+      locksMod.readComments = origReadComments;
+    },
+  };
+}
+
+function runStage37(item, dispatchResults, planQueue) {
+  const agentExecMod = require('../verity/bin/lib/agent-exec.cjs');
+  const nextMod = require('../verity/bin/lib/next.cjs');
+  const origDispatch = agentExecMod.dispatch;
+  const origNext = nextMod.dispatch;
+  let di = 0;
+  let pi = 0;
+  agentExecMod.dispatch = () => {
+    const r = dispatchResults[di];
+    di += 1;
+    return r;
+  };
+  nextMod.dispatch = () => {
+    const p = planQueue[Math.min(pi, planQueue.length - 1)];
+    pi += 1;
+    return p;
+  };
+  try {
+    return worker.runLoop(
+      { repo: 'o/r', cwd: '/tmp', stdout() {}, stderr() {} },
+      { policy: p1Policy(), runId: 'run-stage37', item },
+    );
+  } finally {
+    agentExecMod.dispatch = origDispatch;
+    nextMod.dispatch = origNext;
+  }
+}
+
+// A dispatch decision whose target is a STAGE (kind 'stage') — gateTarget falls
+// through to the run's anchor, which is null for a non-lockable stage item.
+const STAGE_WORK = (number = null) => ({
+  schema: 1,
+  action: 'work',
+  role: 'build',
+  args: ['s'],
+  gate: null,
+  target: { kind: 'stage', number },
+  reason: 'stage ready',
+});
+const NULL_STAGE = { kind: 'stage', number: null, tier: 'P5' };
+
+test('stage 37 REGRESSION: a null-anchor stage build (success, est_usd null) that opened a PR announces the unknown-cost gate ON THAT PR, with the stage-31 parked pointer', () => {
+  const gh = patchTargetedPosts();
+  try {
+    const summary = runStage37(
+      NULL_STAGE,
+      [RESULT({ role: 'build', outcome: 'success', est_usd: null, artifacts: { pr: 7 } })],
+      [STAGE_WORK()],
+    );
+    assertEqual(summary.outcome, 'gated', 'the run parked at the unknown-cost gate');
+    assert(
+      gh.labelsOn(7).includes('verity:awaiting-approval'),
+      `the gate label lands on the opened PR #7 (got: ${JSON.stringify(gh.posts)})`,
+    );
+    const gate = gh.commentsOn(7).find((b) => b.startsWith('⏸️'));
+    assert(gate !== undefined, 'a gate comment was posted on the PR (not silently skipped)');
+    assert(
+      gate.includes('paused at human gate `unknown-cost`'),
+      `the comment names the unknown-cost gate, got: ${gate}`,
+    );
+    assert(
+      /parked: role `build` result of run `run-stage37` at PR #7 head [0-9a-f]{6,40} /.test(gate),
+      `the stage-31 parked pointer targets PR #7, got: ${gate}`,
+    );
+  } finally {
+    gh.restore();
+  }
+});
+
+test('stage 37: a null-anchor stage build that FAILED with unknown cost announces the failed-park gate on the opened PR', () => {
+  const gh = patchTargetedPosts();
+  try {
+    const summary = runStage37(
+      NULL_STAGE,
+      [
+        RESULT({
+          role: 'build',
+          outcome: 'failed',
+          est_usd: null,
+          artifacts: { pr: 9 },
+          error: 'build failed',
+        }),
+      ],
+      [STAGE_WORK()],
+    );
+    assert(
+      summary.outcome.startsWith('failed'),
+      `the run outcome stays failed, got: ${summary.outcome}`,
+    );
+    assert(gh.labelsOn(9).includes('verity:awaiting-approval'), 'the gate label lands on PR #9');
+    const gate = gh.commentsOn(9).find((b) => b.startsWith('⏸️'));
+    assert(gate?.includes('unknown-cost'), `the failed-park gate is on PR #9, got: ${gate}`);
+  } finally {
+    gh.restore();
+  }
+});
+
+test('stage 37: a null-anchor stage role that returned outcome gated announces on the opened PR', () => {
+  const gh = patchTargetedPosts();
+  try {
+    const summary = runStage37(
+      NULL_STAGE,
+      [RESULT({ role: 'build', outcome: 'gated', est_usd: 0.5, artifacts: { pr: 11 } })],
+      [STAGE_WORK()],
+    );
+    assertEqual(summary.outcome, 'gated');
+    assert(
+      gh.labelsOn(11).includes('verity:awaiting-approval'),
+      'the role-gated park lands on PR #11',
+    );
+    assert(
+      gh.commentsOn(11).some((b) => b.startsWith('⏸️')),
+      'a gate comment was posted on the opened PR',
+    );
+  } finally {
+    gh.restore();
+  }
+});
+
+test('stage 37: when an anchor EXISTS, the park announces on the anchor, never on the PR (gateTarget wins — no double-announce)', () => {
+  const gh = patchTargetedPosts();
+  try {
+    // A stage WITH a work-item issue: the item is that lockable issue (#41), so
+    // anchor = 41. The build opens PR #7, then parks at the unknown-cost gate.
+    const summary = runStage37(
+      { kind: 'issue', number: 41, tier: 'P5' },
+      [RESULT({ role: 'build', outcome: 'success', est_usd: null, artifacts: { pr: 7 } })],
+      [STAGE_WORK(41)],
+    );
+    assertEqual(summary.outcome, 'gated');
+    assert(
+      gh.labelsOn(41).includes('verity:awaiting-approval'),
+      'the gate lands on the anchor #41',
+    );
+    assert(
+      gh.commentsOn(41).some((b) => b.startsWith('⏸️')),
+      'the gate comment is on the anchor',
+    );
+    assertEqual(gh.labelsOn(7).length, 0, 'the PR is NOT gate-labeled when an anchor exists');
+    assertEqual(
+      gh.commentsOn(7).filter((b) => b.startsWith('⏸️')).length,
+      0,
+      'no gate comment on the PR — gateTarget wins, no double-announce',
+    );
+  } finally {
+    gh.restore();
+  }
+});
+
+test('stage 37: the PRE-dispatch plan-gate does NOT fall back to a stale prior-iteration PR (scoping guard)', () => {
+  const gh = patchTargetedPosts();
+  try {
+    // Iteration 1: a null-anchor build succeeds with a KNOWN cost (no park) and
+    // opens PR #7 — lastPr is now 7 but is a PRIOR decision's PR. Iteration 2:
+    // the dependency engine returns a plan-level human gate (target null). That
+    // pre-dispatch gate must target gateTarget (null → skipped), never the
+    // stale lastPr #7.
+    const summary = runStage37(
+      NULL_STAGE,
+      [RESULT({ role: 'build', outcome: 'success', est_usd: 0.5, artifacts: { pr: 7 } })],
+      [
+        STAGE_WORK(),
+        {
+          schema: 1,
+          action: 'gated',
+          role: null,
+          args: [],
+          gate: 'build',
+          target: null,
+          reason: 'needs a human',
+        },
+      ],
+    );
+    assertEqual(summary.outcome, 'gated', 'the plan-gate still gates');
+    assertEqual(
+      gh.labelsOn(7).length,
+      0,
+      `the pre-dispatch gate did NOT mislabel the stale PR #7 (got: ${JSON.stringify(gh.posts)})`,
+    );
+    assertEqual(
+      gh.commentsOn(7).filter((b) => b.startsWith('⏸️')).length,
+      0,
+      'no gate comment fell back onto the stale prior-iteration PR',
+    );
+  } finally {
+    gh.restore();
+  }
 });

@@ -146,6 +146,7 @@ jobs:
         with:
           node-version: 20
       - run: npm i -g verity-framework@^1 @anthropic-ai/claude-code
+      # The worker's usage-ledger commit self-identifies (author verity-worker); no git config step needed.
       - run: verity-worker --repo \${{ github.repository }} --once
         env:
           GH_TOKEN: \${{ secrets.VERITY_BOT_TOKEN }}

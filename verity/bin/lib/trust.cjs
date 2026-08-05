@@ -101,6 +101,14 @@ function matchAny(patterns, filePath) {
 // `gh pr checks <n>` exit code IS the contract: 0 = all checks pass, nonzero =
 // failing/pending. Any error (including "no checks") reads as NOT green —
 // fail closed, never open.
+//
+// CALL SITE (stage 19 audit): deliberately still a BOOLEAN, and deliberately
+// unchanged. This is the autonomous merge gate, and the only question it is
+// allowed to answer is "did Verity VERIFY that this PR is green?" — for which
+// unverified and failing are the same answer: no. The three-state reading
+// (ledger.rollupState) exists so the DISPATCH decision can tell them apart and
+// stop instead of looping; it must never travel to a merge decision, because
+// there is no CI state other than verified-green that may merge.
 function checksGreen(pr, ghOpts = {}) {
   try {
     gh.run(['pr', 'checks', String(pr)], ghOpts);
@@ -175,6 +183,23 @@ function classify(pr, policy, ghOpts = {}) {
 // can merge, trust 0 never merges, unknown trust levels gate.
 function decideMerge(verdict, trust, classification, green) {
   if (verdict !== 'approve') {
+    // Stage 36: `escalate` is a first-class non-approve verdict — an
+    // architectural / frozen-contract blocker, not a code-rework request. It
+    // GATES exactly like any other non-approve (this early branch runs before
+    // the trust checks, so escalate can NEVER merge at any trust level), but is
+    // TAGGED so the worker can route it to a human when review.escalate_routing
+    // is ON. Every OTHER non-approve verdict (request_changes / unknown /
+    // absent) keeps the byte-identical fail-closed default below — no `escalate`
+    // field — so the dark-launch default is indistinguishable from today.
+    if (verdict === 'escalate') {
+      return {
+        merge: false,
+        gate: true,
+        escalate: true,
+        reason:
+          "review verdict 'escalate' — architectural / frozen-contract blocker; human review required",
+      };
+    }
     return {
       merge: false,
       gate: true,

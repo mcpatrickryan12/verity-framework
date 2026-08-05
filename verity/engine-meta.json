@@ -1,0 +1,8 @@
+{
+  "version": "1.2.0",
+  "verity": {
+    "claudeCodeMinVersion": "2.1.170",
+    "codexMinVersion": "0.146.0",
+    "knowingMinVersion": "0.15.1"
+  }
+}

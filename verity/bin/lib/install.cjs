@@ -27,7 +27,24 @@ const TEMPLATES_DIR = path.join(PKG_ROOT, 'verity', 'templates');
 // this table keyed on its option; no knowing content exists yet). Templates
 // live once in verity/templates/ and are the ONLY place cross-cutting prompt
 // content is written — role sources stay clean.
-const PREAMBLES = [{ template: 'preamble-runtime.md.tmpl', option: null }];
+//
+// `preamble-verity-git.md.tmpl` (stage 17, ADR-0012) is the first real user of
+// the conditional mechanism. It is OFF by default and no install ever turns it
+// on: it is set only by a headless driver whose runtime cannot write under
+// `.git`, for the runs where Verity really has created the branch and really
+// will commit/push/PR (it interpolates {{branch}}, so it can only be true when
+// a branch exists). Every install path, every other host, and every golden
+// render fixture are therefore byte-identical to before it existed.
+// `preamble-verity-github.md.tmpl` (stage 24, ADR-0013) extends the same
+// mechanism one layer up: GitHub I/O. OFF by default, set only by a headless
+// contained render that was handed a Verity-gathered state snapshot (it
+// interpolates {{stateSnapshot}}, so it can only be true when facts exist).
+// Installs and every other host stay byte-identical, exactly like the git block.
+const PREAMBLES = [
+  { template: 'preamble-runtime.md.tmpl', option: null },
+  { template: 'preamble-verity-git.md.tmpl', option: 'verityPerformsGit' },
+  { template: 'preamble-verity-github.md.tmpl', option: 'verityPerformsGitHub' },
+];
 
 // Recorded install options (the idempotency state file alongside the engine
 // copy). Chosen options must round-trip so a re-run with the same options is
@@ -118,8 +135,38 @@ function commandFiles(srcCommands, ext = '.md') {
   return fs.readdirSync(srcCommands).filter((n) => n.endsWith(ext));
 }
 
+// engine-meta.json (stage 35): the version floors doctor.cjs / the drivers used
+// to fetch via `require('../../../package.json')` — an above-engine-root path
+// that a copied engine (only the `verity/` subtree is deployed) cannot resolve,
+// so it crashed EVERY command at load. The metadata now lives INSIDE the subtree
+// and is (re)stamped FRESH from the live package.json on every copy, so a
+// deployed copy is self-contained AND accurate.
+const ENGINE_META_REL = path.join('verity', 'engine-meta.json');
+
+// Read straight from the live package.json — install.cjs runs only from the full
+// checkout / npm package (it is the thing that CREATES copies; a copy never
+// re-installs), so this above-root read is legitimate here. PKG_ROOT is a
+// variable, so this is not the crash-class literal-path escape the escape-scan
+// guard forbids inside the deployed runtime.
+function engineMetaContent() {
+  const pkg = require(path.join(PKG_ROOT, 'package.json'));
+  return `${JSON.stringify({ version: pkg.version, verity: pkg.verity }, null, 2)}\n`;
+}
+
+// Stamp <target>/verity/engine-meta.json. Called at copy time AND by
+// scripts/stamp-engine-meta.cjs to keep the committed checkout copy in sync.
+function stampEngineMeta(target) {
+  fs.writeFileSync(path.join(target, ENGINE_META_REL), engineMetaContent());
+  return ENGINE_META_REL;
+}
+
 function copyInternals(target) {
   fs.cpSync(path.join(PKG_ROOT, 'verity'), path.join(target, 'verity'), { recursive: true });
+  // Re-stamp engine-meta.json fresh from THIS package's package.json. A copy
+  // deployed BEFORE stage 35 hard-crashed on load; the next `verity install`
+  // re-stamps it and the crash is gone. Even an un-refreshed old copy no longer
+  // crashes: engine-meta.cjs falls back to built-in floors with a stderr notice.
+  stampEngineMeta(target);
 }
 
 function claudeDir(opts) {
@@ -450,6 +497,7 @@ jobs:
         with:
           node-version: 20
       - run: npm i -g verity-framework@^1 @anthropic-ai/claude-code
+      # The worker's usage-ledger commit self-identifies (author verity-worker); no git config step needed.
       - run: verity-worker --repo \${{ github.repository }} --once
         env:
           GH_TOKEN: \${{ secrets.VERITY_BOT_TOKEN }}
@@ -582,6 +630,8 @@ module.exports = {
   transformForOpenCode,
   openCodeDir,
   installCodex,
+  stampEngineMeta,
+  ENGINE_META_REL,
   transformForCodex,
   codexDir,
   codexSkillMeta,

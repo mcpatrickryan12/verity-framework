@@ -8,7 +8,7 @@
     "git_write": true,
     "github_read": true,
     "github_write": true,
-    "network": true,
+    "network": false,
     "deploy": false
   },
   "codex": {

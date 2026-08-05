@@ -29,8 +29,8 @@ const CAPABILITY_KEYS = [
   'deploy',
   // Additive v1.x key (stage 9, ADR-0007): may the role's own edits touch the
   // protected config roots (.github/**, .verity/**)? Defaults closed like
-  // every capability; the codex driver projects `false` into generated
-  // protected-path write-denial rules (codex.cjs commandRules).
+  // every capability; stage 11 (ADR-0011) enforces `false` with the post-run
+  // invariant checker (agents/invariants.cjs) instead of a Codex rules file.
   'write_protected_paths',
 ];
 
@@ -199,4 +199,141 @@ function applyOverrides(policy, overrides = {}) {
   return { ...policy, codex };
 }
 
-module.exports = { APPROVALS, CAPABILITY_KEYS, SANDBOXES, applyOverrides, loadPolicy };
+// --- capability honesty rule (stage 11, ADR-0011 + ADR-0007) -------------------
+// "Codex must never appear to enforce something it does not." Every restriction
+// a role DECLARES (a capability that is false) maps here to the mechanism that
+// actually enforces it. A restriction whose mechanism is null is UNENFORCEABLE:
+// the run is refused (exit 30, slug `unenforceable-policy`) unless the operator
+// explicitly acknowledges the gap — the additive, default-absent autonomy knob
+// `agent.acknowledged_enforcement_gaps` (fail closed: absence acknowledges
+// nothing).
+//
+// The three mechanisms that exist today, and what each one is PROVEN to do
+// (docs/dev/codex-enforcement-spike-0.146.0.md):
+//   codex-sandbox        `--sandbox {read-only|workspace-write}` on `codex
+//                        exec`. Proven (F6): writes are confined to the
+//                        workspace root. Nothing finer — per-path permission
+//                        profiles are ignored by `exec` (F1).
+//   credential-stripping the child environment is built from an enumerated
+//                        passlist (codex.cjs childEnv), so a credential the
+//                        capabilities do not grant is simply ABSENT. Absent
+//                        credentials cannot be misused by any command, wrapped
+//                        or not (ADR-0011 layer 2).
+//   post-run-invariants  agents/invariants.cjs: pre-run snapshot vs post-run
+//                        state, hard revert where safe, loud failure
+//                        (ADR-0011 layer 5 — mandatory, not a backstop).
+//   verity-performed-git the PROVISION side of the rule (stage 17, ADR-0012):
+//                        the model cannot write under `.git` at all, so
+//                        deterministic Verity code performs the branch, the
+//                        commit, the push and the PR outside its execution
+//                        context (agents/git-lifecycle.cjs).
+const MECHANISMS = [
+  'codex-sandbox',
+  'credential-stripping',
+  'post-run-invariants',
+  'verity-performed-git',
+];
+
+const ENFORCEMENT_MECHANISMS = {
+  // The role may not write the repository at all → `--sandbox read-only`
+  // (loadPolicy already refuses a workspace-write projection without it).
+  write_repository: 'codex-sandbox',
+  // .github/** and .verity/** are snapshotted before the run and diffed after;
+  // a mutation is reverted from the snapshot and fails the run.
+  write_protected_paths: 'post-run-invariants',
+  // Branch/tag/HEAD movement is detected by the ref snapshot diff.
+  git_write: 'post-run-invariants',
+  // No GH_TOKEN/GITHUB_TOKEN in the child environment → `gh` cannot mutate
+  // anything on GitHub, whatever the model types.
+  github_write: 'credential-stripping',
+  // No cloud/registry credentials in the child environment.
+  deploy: 'credential-stripping',
+  // UNENFORCEABLE on the exec path. `codex exec` ignores permission profiles
+  // (F1), so the profile-only network switch proven under `codex sandbox` (F6)
+  // does not bind here, and no `-c` key is proven to. Until network denial is
+  // enforced at the OS boundary this restriction fails closed.
+  network: null,
+};
+
+// Capabilities Verity makes NO enforcement claim about. Listing them here is
+// deliberate and auditable: restricting them is prompt-level guidance only, so
+// they are neither "enforced" (a lie) nor a refusal (noise on every role).
+//   read_repository / git_read   the workspace physically contains the repo and
+//                                its history; only tier 2's shaped disposable
+//                                workspace (stage 14) can make this a fact.
+//   run_tests                    running the suite is an ordinary in-workspace
+//                                command; nothing distinguishes it.
+//   github_read                  the GitHub credential is ONE token whose
+//                                presence is governed by github_write, so a
+//                                role that holds github_write keeps read access
+//                                regardless of this key.
+const ADVISORY_CAPABILITIES = ['read_repository', 'run_tests', 'git_read', 'github_read'];
+
+// --- the PROVISION half of the honesty rule (stage 17, ADR-0012) ---------------
+// ENFORCEMENT_MECHANISMS above answers "does a declared RESTRICTION bind?".
+// This table answers the mirror-image question: "can a declared GRANT be
+// honoured at all?" — and it exists because one capability cannot be honoured
+// the obvious way on every runtime.
+//
+// `git_write` is that capability. Where the model's sandbox makes `.git`
+// read-only, granting git_write to the ROLE grants it nothing: `checkout -b`
+// and `commit` fail rc=128 whatever the policy says. Under ADR-0012 the grant
+// therefore projects to "Verity performs git on this role's behalf", performed
+// by deterministic code outside the model's execution context. Same fail-closed
+// discipline as the restriction side: if Verity cannot provide it for a given
+// run (no repository, unborn HEAD, no committer identity, no remote to push
+// to), the run is REFUSED (exit 30, slug `git-unprovidable`) rather than
+// finishing with no branch, no commit and no PR while reporting success.
+//
+// A runtime whose harness performs its own git (the reference driver) never
+// consults this table — it exports none of the lifecycle hooks, so its
+// coordinator path is unchanged.
+const PROVIDED_CAPABILITIES = { git_write: 'verity-performed-git' };
+
+// Every restriction a role declares that has NO enforcing mechanism, sorted.
+// Grants (capability true) are never gaps — nothing needs enforcing.
+function enforcementGaps(policy) {
+  return Object.keys(ENFORCEMENT_MECHANISMS)
+    .filter((cap) => ENFORCEMENT_MECHANISMS[cap] === null && policy.capabilities[cap] !== true)
+    .sort();
+}
+
+// Fail-closed gate called before any provider process is spawned. Returns the
+// acknowledgements that ACTUALLY applied (so the caller can surface them in the
+// result — an invisible acknowledgement would be its own kind of theater).
+// Throws AgentExecError (exit 30) when a gap is unacknowledged
+// (`unenforceable-policy`) or an acknowledgement names something that is not a
+// capability (`bad-acknowledgement` — a typo must never fail silently open OR
+// silently closed).
+function assertEnforceable(policy, acknowledged = []) {
+  const unknown = acknowledged.filter((cap) => !CAPABILITY_KEYS.includes(cap));
+  if (unknown.length > 0) {
+    throw new AgentExecError(
+      `fail-closed: acknowledged_enforcement_gaps names ${unknown.map((c) => `'${c}'`).join(', ')}, which is not a capability in contracts/role-capability-policy.md v1 (known: ${CAPABILITY_KEYS.join(', ')})`,
+      'bad-acknowledgement',
+    );
+  }
+  const gaps = enforcementGaps(policy);
+  const unacknowledged = gaps.filter((cap) => !acknowledged.includes(cap));
+  if (unacknowledged.length > 0) {
+    throw new AgentExecError(
+      `fail-closed: the role declares ${unacknowledged.map((c) => `${c}: false`).join(', ')}, but Verity has NO mechanism that enforces it on this provider — refusing the run rather than appearing to enforce it (ADR-0011). Acknowledge the gap explicitly with agent.acknowledged_enforcement_gaps: [${unacknowledged.join(', ')}] in .verity/autonomy.yml (or --acknowledge-gaps ${unacknowledged.join(',')}) to run anyway, with the gap recorded in the result`,
+      'unenforceable-policy',
+    );
+  }
+  return gaps;
+}
+
+module.exports = {
+  ADVISORY_CAPABILITIES,
+  APPROVALS,
+  CAPABILITY_KEYS,
+  ENFORCEMENT_MECHANISMS,
+  MECHANISMS,
+  PROVIDED_CAPABILITIES,
+  SANDBOXES,
+  applyOverrides,
+  assertEnforceable,
+  enforcementGaps,
+  loadPolicy,
+};

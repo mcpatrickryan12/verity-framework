@@ -1,7 +1,7 @@
 {
   "name": "verity-framework",
-  "version": "1.1.0",
-  "description": "Verity — a CI/CD-native, GitHub-native AI delivery framework: specialized roles from idea to operated production, plus an optional headless autonomy worker, gated and audited through GitHub.",
+  "version": "1.2.0",
+  "description": "Verity \u2014 a CI/CD-native, GitHub-native AI delivery framework: specialized roles from idea to operated production, plus an optional headless autonomy worker, gated and audited through GitHub.",
   "keywords": [
     "verity",
     "verity-auto",
@@ -33,11 +33,12 @@
   },
   "verity": {
     "claudeCodeMinVersion": "2.1.170",
-    "codexMinVersion": "0.42.0",
+    "codexMinVersion": "0.146.0",
     "knowingMinVersion": "0.15.1"
   },
   "scripts": {
     "test": "node scripts/run-tests.cjs",
+    "stamp-meta": "node scripts/stamp-engine-meta.cjs",
     "lint": "biome ci .",
     "prepublishOnly": "npm run lint && npm test"
   },

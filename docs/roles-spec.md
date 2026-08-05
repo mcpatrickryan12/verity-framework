@@ -265,7 +265,7 @@ Forensic interview of the real build (Switchboard) added these to the design. De
 2. **Confirm CI is actually green** *(notebook)* — the all-green floor; if not, bounce back.
 3. **Adversarial review against source** *(brain, skeptical)* — for each acceptance condition + security invariant + contract, verify against the real diff (not the PR text). Build a verdict table: claim → checked-against-source → pass/fail.
 4. **Scope/quality check** *(brain)* — stayed within the stage; no contract drift; no secrets committed; migration additive; kill-switch default-off; UI-smoke asset present.
-5. **Verdict** *(brain)* — APPROVE / REQUEST-CHANGES (→ Stage Manager/executor) / ESCALATE (contract/arch concern → re-intake via `/plan` or architect gate; write an ADR).
+5. **Verdict** *(brain)* — APPROVE / REQUEST-CHANGES (code bug, failing test, fixable config → Stage Manager/executor) / ESCALATE (frozen-contract conflict, ADR-level concern, or architecture mismatch → re-intake via `/plan` or architect gate; write an ADR). Headless, both REQUEST-CHANGES and ESCALATE GATE at `review:merge` (never merge); when `review.escalate_routing` is on, an ESCALATE additionally parks the work item with `verity:needs-human` and its gate names the next role. Default-off, ESCALATE routes exactly like REQUEST-CHANGES.
 6. **Merge** *(notebook)* — squash + delete-branch (mind the **stacked-PR auto-close trap** — re-home over resolve, or merge base without `--delete-branch`), `Closes #N`, attach Milestone. Genuine conflict → hand to (de-emphasized) Merge Manager.
 7. **Signal** — merged `main` becomes the base for dependent stages. **Merges accrue; the Reviewer does NOT deploy** — the Release/Deploy Operator later decides when to cut a release (batched or per-merge).
 

@@ -75,6 +75,10 @@
           "description": "What the worker does when a role reports UNKNOWN cost (est_usd null — never $0, ADR-0008). 'gate' pauses at the existing human gate (default until a provider's cost accounting is proven), 'fail' stops the run, 'allow_with_token_limit' proceeds bounded by token ceilings alone. Null never counts against the daily budget breaker.",
           "enum": ["gate", "allow_with_token_limit", "fail"],
           "default": "gate"
+        },
+        "unverified_ci_behavior": {
+          "description": "ADDITIVE, DEFAULT-ABSENT (stage 19, issue #50). What the worker does when a PR's CI cannot be VERIFIED — GitHub reports no checks at all for it, so 'no CI configured' and 'CI failing' are the same observation. Absent = 'gate': the run pauses at the ci:unverified human gate, because Verity cannot honestly claim the stage is green or that it is red. 'allow_without_merge' lets the stage advance to review instead, for repositories that legitimately have no CI. NEITHER value can merge on unverified CI: merge requires a VERIFIED green reading (trust.checksGreen for the autonomous ladder, review.canMerge for the CLI), which an unchecked PR can never produce.",
+          "enum": ["gate", "allow_without_merge"]
         }
       }
     },
@@ -139,6 +143,15 @@
         "ignore_rules": {
           "type": "boolean",
           "default": false
+        },
+        "acknowledged_enforcement_gaps": {
+          "description": "ADDITIVE, DEFAULT-ABSENT (stage 11, ADR-0011 capability honesty rule). Capabilities whose DENIAL Verity cannot enforce on the selected provider, acknowledged explicitly by the operator. Today the only such capability is 'network': codex exec ignores permission profiles, so a role declaring network:false is REFUSED (exit 30 unenforceable-policy) unless listed here. Listing a capability grants nothing — it records that its denial is unenforced, and every affected run's result carries that admission. Codex-only.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "containment_tier": {
+          "description": "ADDITIVE, DEFAULT-ABSENT (stage 14, ADR-0011). Which enforcement tier the worker demands of every codex dispatch. Absent = tier 1: credential stripping plus mandatory post-run invariants, which catch a containment violation AFTER it happened and revert what is safely revertible — adequate for supervised/trust-0. 2 = additionally run each role in a DISPOSABLE SHAPED WORKSPACE (paths the role may not touch are physically absent) with a GATED MERGE-BACK deciding what propagates into the real repository, making the violation impossible to propagate. UNATTENDED codex autonomy (mode: autonomous) is REFUSED below 2 (exit 30 containment-tier-required). Codex-only — claude has no containment tiers.",
+          "enum": [1, 2]
         }
       }
     }

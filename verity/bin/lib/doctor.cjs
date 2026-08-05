@@ -40,7 +40,18 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const PKG = require('../../../package.json');
+// Version floors come from the IN-SUBTREE engine-meta.json (stage 35), not a
+// top-level `require('../../../package.json')` that resolved above the engine
+// root and crashed every command from a copied engine. checkDependency's
+// `opts.pkg` seam is unchanged — this only swaps where the default reads from.
+const PKG = require('./engine-meta.cjs').load();
+
+// The Codex required-feature matrix (stage 12). Doctor names the FEATURE that
+// motivates `verity.codexMinVersion` in its too-old diagnosis, so an operator
+// told to upgrade also learns what the pin is buying. The matrix module is a
+// leaf on purpose: the codex driver requires doctor (for checkBinary), so
+// doctor must never require the driver back.
+const codexFeatures = require('./agents/codex-features.cjs');
 
 // --- shared version probe (used by agent-exec.cjs) ----------------------------
 
@@ -115,6 +126,10 @@ function checkBinary(bin, opts = {}) {
 //   remedies      optional { missing, 'too-old', auth } remediation commands
 //                 appended to the failing detail as "Run: <cmd>" (stage 9 —
 //                 rows without it are byte-identical to their stage-1 output)
+//   minVersionMotivation
+//                 optional one-line rationale appended to the TOO-OLD detail,
+//                 naming the required feature(s) the minimum is derived from
+//                 (stage 12 — rows without it stay byte-identical)
 const DEPENDENCIES = [
   { name: 'git', binary: 'git', versionArgs: ['--version'] },
   { name: 'gh', binary: 'gh', versionArgs: ['--version'], authCheck: ['auth', 'status'] },
@@ -155,6 +170,10 @@ const CODEX_DEPENDENCIES = [
     binary: 'codex',
     versionArgs: ['--version'],
     minVersionKey: 'codexMinVersion',
+    // Stage 12: the pin is feature-derived, so the too-old diagnosis says which
+    // features it is derived FROM. "codex 0.42.0 is too old" with no reason is
+    // exactly the unauditable claim this stage removed.
+    minVersionMotivation: codexFeatures.pinMotivation(),
     authCheck: ['login', 'status'],
     remedies: {
       missing: 'npm install -g @openai/codex',
@@ -204,9 +223,12 @@ function checkDependency(dep, opts = {}) {
     return row;
   }
   if (probe.why === 'too-old') {
+    // The motivation clause sits BEFORE the remedy so the message reads
+    // "too old — because X — Run: <fix>"; rows without one are unchanged.
+    const why = dep.minVersionMotivation ? ` — ${dep.minVersionMotivation}` : '';
     row.detail = remedy(
       'too-old',
-      `${dep.name} ${probe.version} is below the configured minimum ${minVersion} (package.json verity.${dep.minVersionKey})`,
+      `${dep.name} ${probe.version} is below the configured minimum ${minVersion} (package.json verity.${dep.minVersionKey})${why}`,
     );
     return row;
   }

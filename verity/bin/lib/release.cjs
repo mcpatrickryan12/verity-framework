@@ -7,6 +7,8 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const ledger = require('./ledger.cjs');
+const promotionConfig = require('./promotion-config.cjs');
+const { sanitize } = require('./changelog-sanitize.cjs');
 
 function git(cwd, args) {
   try {
@@ -98,21 +100,43 @@ function run(cmd, args) {
   execFileSync(cmd, args, { stdio: 'inherit' });
 }
 
-// A release has three side effects (tag, changelog edit, push) that must be
-// all-or-nothing: a half-done release leaves either a dirty CHANGELOG.md with no
-// tag, or a local tag that never pushed. We order them cheap-and-reversible-first
-// (tag → changelog → push) and roll back the earlier steps if a later one throws.
-// The git runner is injectable (opts.run) so partial failure is unit-testable.
-function cut(cwd, opts = {}) {
+// The one derivation both `cut` and `prepare` share (extracted in stage 42 so
+// the two verbs can never disagree): version from the latest tag, changelog
+// from the Conventional Commits since it. Pure computation, no side effects.
+function derive(cwd, opts = {}) {
   const tags = opts.tags || gitTags(cwd);
   const previous = ledger.latestTag(tags);
   const version = nextVersion(previous, opts.bump || 'patch');
   const tag = `v${version}`;
   const commits = opts.commits || commitsSince(cwd, previous);
   const changelog = changelogFrom(commits, version);
-  const result = { version, tag, previous, changelog, commitCount: commits.length };
+  return { version, tag, previous, changelog, commitCount: commits.length };
+}
+
+// A release has three side effects (tag, changelog edit, push) that must be
+// all-or-nothing: a half-done release leaves either a dirty CHANGELOG.md with no
+// tag, or a local tag that never pushed. We order them cheap-and-reversible-first
+// (tag → changelog → push) and roll back the earlier steps if a later one throws.
+// The git runner is injectable (opts.run) so partial failure is unit-testable.
+function cut(cwd, opts = {}) {
+  const { version, tag, previous, changelog, commitCount } = derive(cwd, opts);
+  const result = { version, tag, previous, changelog, commitCount };
   if (opts.dryRun) {
     return { ...result, applied: false };
+  }
+
+  // The authoritative-tag guard (stage 42, ADR-0022 §3): once the dev/prod
+  // split is active, vX.Y.Z tags are born in prod via the promotion flow —
+  // habit-driven `release cut` in dev must refuse BEFORE any side effect.
+  // Reading the config throws on a malformed file (exit 20, never silently
+  // off); an absent file leaves cut byte-identical to today. --dry-run
+  // returned above: the computation is harmless and stays available.
+  if (promotionConfig.read(cwd).split_active) {
+    const err = new Error(
+      `release cut refused: ${promotionConfig.PROMOTION_CONFIG_PATH} has split_active: true — authoritative ${tag} tags are minted in the production repo by the promotion flow, not in dev. Use \`verity release prepare\` to compute the version and sanitized changelog section here (\`release cut --dry-run\` also still computes without tagging).`,
+    );
+    err.exitCode = 20;
+    throw err;
   }
 
   const exec = opts.run || run;
@@ -140,6 +164,30 @@ function cut(cwd, opts = {}) {
   return { ...result, applied: true };
 }
 
+// `release prepare` (stage 42, ADR-0022 §2) — the dev-side release computation
+// after the split: the SAME derivation as `cut` (shared `derive`, so the two
+// can never disagree) with the changelog section already sanitized (`#NN` →
+// `dev#NN`). It NEVER tags, commits, or pushes in any mode. Default is
+// report-only (nothing touched); `--apply` prepends the sanitized section to
+// CHANGELOG.md as a working-tree edit only.
+function prepare(cwd, opts = {}) {
+  const d = derive(cwd, opts);
+  const changelog = sanitize(d.changelog);
+  const result = {
+    version: d.version,
+    tag_candidate: d.tag,
+    previous: d.previous,
+    changelog,
+    commitCount: d.commitCount,
+    applied: false,
+  };
+  if (!opts.apply) {
+    return result;
+  }
+  prependChangelog(cwd, changelog);
+  return { ...result, applied: true };
+}
+
 function current(cwd) {
   const latest = ledger.latestTag(gitTags(cwd));
   return { latest, version: latest ? latest.replace(/^v/, '') : null, raw: latest || '' };
@@ -161,7 +209,10 @@ function dispatch(args, flags) {
       push: !flags['no-push'],
     });
   }
-  throw new Error(`unknown release verb: ${verb || '(none)'} — use cut|changelog|current`);
+  if (verb === 'prepare') {
+    return prepare(cwd, { bump: flags.bump, apply: Boolean(flags.apply) });
+  }
+  throw new Error(`unknown release verb: ${verb || '(none)'} — use cut|prepare|changelog|current`);
 }
 
-module.exports = { nextVersion, changelogFrom, cut, current, dispatch };
+module.exports = { nextVersion, changelogFrom, cut, prepare, current, dispatch };

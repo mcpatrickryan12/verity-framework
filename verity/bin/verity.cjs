@@ -32,6 +32,7 @@ const golive = require('./lib/golive.cjs');
 const smoke = require('./lib/smoke.cjs');
 const deployment = require('./lib/deployment.cjs');
 const doctor = require('./lib/doctor.cjs');
+const promotion = require('./lib/promotion.cjs');
 
 function parseArgs(argv) {
   const positional = [];
@@ -187,6 +188,21 @@ const COMMANDS = {
   deployment(rest, flags) {
     return deployment.dispatch(rest, flags);
   },
+  // Dev→prod projection builder + verifier + proposer + finalizer (stages
+  // 40–44, contracts/production-projection.md + contracts/promotion-records.md).
+  // `promotion project <ref>` builds the projection; `promotion verify
+  // <staging-dir> [--report <path>] [--baseline <version>]` proves it
+  // (in-staging gates, pack-content inspection, opt-in published-tarball
+  // byte-match) and extends the report additively; `promotion propose
+  // <version> --staging <dir> [--dry-run]` turns a verified projection into
+  // the promotion PR in prod plus both provenance records; `promotion
+  // finalize <version>` verifies the MERGED promotion tree against the PROM
+  // record, then mints the authoritative tag + GitHub Release in prod and
+  // completes the record (npm publish NOT executed — O4). Verdicts map onto
+  // exit codes 0 / 20 contract violation / 30 infra (set in main()).
+  promotion(rest, flags) {
+    return promotion.dispatch(rest, flags);
+  },
   // Host-dependency preflight (stage 1): one JSON report row per external
   // binary Verity leans on (git, gh + auth, claude + min version). --quiet =
   // exit-code-only; exit 0 iff every check is ok (mapped in main()).
@@ -242,6 +258,19 @@ function main() {
         emit(result, flags);
       }
       process.exitCode = agentExec.exitCodeFor(result);
+      return;
+    }
+    if (noun === 'promotion') {
+      // Stage 40 contract: with --json, stdout is exactly ONE compact JSON
+      // object (pipe-safe, the `next --json` convention). The result envelope
+      // carries the projection verdict; 0 built / 20 contract violation /
+      // 30 infra — the report file is written even on failure.
+      if (flags.json) {
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } else {
+        emit(result, flags);
+      }
+      process.exitCode = promotion.exitCodeFor(result);
       return;
     }
     if (noun === 'doctor') {

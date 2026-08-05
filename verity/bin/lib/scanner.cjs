@@ -12,6 +12,15 @@
 //     botLogin     — the bot's GitHub login. P4 hard rule: skip items where
 //                    author.login == botLogin (no self-feeding). When absent,
 //                    no P4 author filtering happens (the worker MUST pass it).
+//     warn         — `(message) => void`, DEFAULT silent (the usage.cjs
+//                    opts.warn precedent — a library never writes to a stream
+//                    uninvited). Called ONCE per scan, with the skipped count,
+//                    when the P4 no-self-feeding rule drops ≥1 request
+//                    (stage 28): the filter is by design, but its silence made
+//                    a single-account operator's `verity:request` read as
+//                    plain "no eligible work". Diagnostics only — the caller
+//                    decides where it surfaces (the worker: stderr + the idle
+//                    line); it never becomes a GitHub comment.
 //     isLocked     — injectable lock predicate `(item) => boolean`. Items for
 //                    which it returns true are skipped in every tier. DEFAULT:
 //                    () => false (no filtering). This is the seam for the §4.3
@@ -163,6 +172,7 @@ function scan(opts = {}) {
   };
   const isLocked = opts.isLocked || (() => false);
   const botLogin = opts.botLogin ? String(opts.botLogin).toLowerCase() : null;
+  const warn = opts.warn || (() => {});
 
   for (const [tier, queries] of Object.entries(TIER_QUERIES)) {
     let items = queries.flatMap((q) =>
@@ -170,7 +180,15 @@ function scan(opts = {}) {
     );
     items = items.filter((it) => !it.labels.includes(NEEDS_HUMAN_LABEL));
     if (tier === 'P4' && botLogin !== null) {
+      // The no-self-feeding rule itself is untouched (a worker that feeds
+      // itself work is the runaway the tiers exist to prevent) — but the drop
+      // must not be silent (stage 28): say how much was filtered, once.
+      const before = items.length;
       items = items.filter((it) => (it.author || '').toLowerCase() !== botLogin);
+      const skipped = before - items.length;
+      if (skipped > 0) {
+        warn(`skipped ${skipped} self-authored request(s) (no self-feeding; see docs/autonomy.md)`);
+      }
     }
     items = items.filter((it) => !isLocked(it));
     if (items.length > 0) {
@@ -237,4 +255,16 @@ function fetchTargetLabels(target, ghOpts) {
   }
 }
 
-module.exports = { scan, TIER_QUERIES, normalize, byCreatedAt, NEEDS_HUMAN_LABEL };
+// `fetchTargetLabels` is additionally exported (stage 33) for the worker's
+// deferred-refusal fresh-read fallback: it reads a SPECIFIC item's labels from
+// the primary DB (`gh <noun> view N --json labels`), NOT the search index, so
+// it reflects a just-applied label immediately — the exact property that lets a
+// deferred unknown-cost refusal re-check a lagged P1 approval without a search.
+module.exports = {
+  scan,
+  TIER_QUERIES,
+  normalize,
+  byCreatedAt,
+  fetchTargetLabels,
+  NEEDS_HUMAN_LABEL,
+};

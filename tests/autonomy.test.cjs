@@ -48,6 +48,7 @@ gates:                           # roles that ALWAYS pause for a human
 
 review:
   trust: 0                       # 0 none | 1 low-risk auto-merge | 2 full
+  escalate_routing: false        # stage 36 — park escalate verdicts for a human
   low_risk:
     max_changed_lines: 150
     allowed_paths: ["docs/**", "tests/**", "**/*.md"]
@@ -384,6 +385,144 @@ test('stage 9 cross-field: sandbox/approval are codex-only — rejected under cl
     writePolicy(dir, `agent:\n  ${knob.replace(': ', ': ')}\n`);
     loadRejects(dir, 'only meaningful with agent.provider codex', `claude + ${knob}`);
   }
+});
+
+// --- stage 11: agent.acknowledged_enforcement_gaps (additive, default-absent) ---
+
+test('stage 11 knob: default-ABSENT — no policy acknowledges anything (fail closed)', () => {
+  for (const text of ['', 'mode: supervised\n', 'agent:\n  provider: codex\n']) {
+    const dir = tmpProject();
+    writePolicy(dir, text);
+    const policy = autonomy.loadPolicy(dir);
+    assertEqual(
+      policy.agent.acknowledged_enforcement_gaps,
+      undefined,
+      'the knob is absent unless the operator writes it — absence acknowledges NOTHING',
+    );
+  }
+});
+
+// --- stage 36: review.escalate_routing (additive boolean, default OFF) ---
+
+test('stage 36 knob: review.escalate_routing defaults to false (OFF) when absent', () => {
+  for (const text of ['', 'mode: supervised\n', 'review:\n  trust: 1\n']) {
+    const dir = tmpProject();
+    writePolicy(dir, text);
+    assertEqual(
+      autonomy.loadPolicy(dir).review.escalate_routing,
+      false,
+      'absent escalate_routing merges to the default-OFF state',
+    );
+  }
+});
+
+test('stage 36 knob: review.escalate_routing accepts a boolean, rejects a non-boolean', () => {
+  const on = tmpProject();
+  writePolicy(on, 'review:\n  escalate_routing: true\n');
+  assertEqual(autonomy.loadPolicy(on).review.escalate_routing, true, 'true is accepted');
+
+  const bad = tmpProject();
+  writePolicy(bad, 'review:\n  escalate_routing: yes\n');
+  loadRejects(bad, 'review.escalate_routing', 'non-boolean escalate_routing rejected');
+});
+
+test('stage 11 knob: an explicit acknowledgement loads as a list under codex', () => {
+  const dir = tmpProject();
+  writePolicy(
+    dir,
+    [
+      'mode: supervised',
+      'agent:',
+      '  provider: codex',
+      '  acknowledged_enforcement_gaps: [network]',
+      '',
+    ].join('\n'),
+  );
+  const policy = autonomy.loadPolicy(dir);
+  assertEqual(
+    JSON.stringify(policy.agent.acknowledged_enforcement_gaps),
+    '["network"]',
+    'the operator acknowledgement the worker forwards to agent-exec (ADR-0011)',
+  );
+  assertEqual(policy.agent.provider, 'codex', 'sibling keys unaffected');
+});
+
+test('stage 11 knob: non-list values and claude+acknowledgement are rejected with exit 20', () => {
+  const bad = tmpProject();
+  writePolicy(bad, 'agent:\n  provider: codex\n  acknowledged_enforcement_gaps: network\n');
+  loadRejects(bad, 'acknowledged_enforcement_gaps', 'a bare scalar is not a list');
+  const claude = tmpProject();
+  writePolicy(claude, 'agent:\n  acknowledged_enforcement_gaps: [network]\n');
+  loadRejects(
+    claude,
+    'only meaningful with agent.provider codex',
+    'claude has no gap to acknowledge',
+  );
+  const empty = tmpProject();
+  writePolicy(empty, 'agent:\n  acknowledged_enforcement_gaps: []\n');
+  assertEqual(
+    JSON.stringify(autonomy.loadPolicy(empty).agent.acknowledged_enforcement_gaps),
+    '[]',
+    'an EMPTY list is the default-absent state and stays legal under claude',
+  );
+});
+
+test('stage 11 knob: the shipped JSON schema publishes it as an additive string list', () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', 'schemas', 'autonomy.schema.json'), 'utf8'),
+  );
+  const knob = schema.properties.agent.properties.acknowledged_enforcement_gaps;
+  assertEqual(knob.type, 'array', 'published in the shipped schema');
+  assertEqual(knob.items.type, 'string');
+  assert(!('default' in knob), 'no default — absence is the fail-closed state');
+  assert(/ADR-0011/.test(knob.description), 'the description points at the decision');
+});
+
+// --- stage 14: agent.containment_tier (additive, default-absent, fail closed) ---
+
+test('stage 14 knob: default-ABSENT — no policy claims tier 2 (fail closed)', () => {
+  for (const text of ['', 'mode: supervised\n', 'agent:\n  provider: codex\n']) {
+    const dir = tmpProject();
+    writePolicy(dir, text);
+    assertEqual(
+      autonomy.loadPolicy(dir).agent.containment_tier,
+      undefined,
+      'the knob is absent unless the operator writes it — absence is tier 1',
+    );
+  }
+});
+
+test('stage 14 knob: an explicit tier loads under codex; bad values and claude are rejected', () => {
+  const dir = tmpProject();
+  writePolicy(dir, 'mode: autonomous\nagent:\n  provider: codex\n  containment_tier: 2\n');
+  assertEqual(autonomy.loadPolicy(dir).agent.containment_tier, 2, 'the tier the worker demands');
+
+  const one = tmpProject();
+  writePolicy(one, 'agent:\n  provider: codex\n  containment_tier: 1\n');
+  assertEqual(autonomy.loadPolicy(one).agent.containment_tier, 1, 'tier 1 is expressible too');
+
+  const bad = tmpProject();
+  writePolicy(bad, 'agent:\n  provider: codex\n  containment_tier: 3\n');
+  loadRejects(bad, 'containment_tier', 'there is no tier 3');
+
+  const claude = tmpProject();
+  writePolicy(claude, 'agent:\n  containment_tier: 2\n');
+  loadRejects(
+    claude,
+    'only meaningful with agent.provider codex',
+    'claude has no ADR-0011 containment tiers',
+  );
+});
+
+test('stage 14 knob: the shipped JSON schema publishes it with NO default', () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', 'schemas', 'autonomy.schema.json'), 'utf8'),
+  );
+  const knob = schema.properties.agent.properties.containment_tier;
+  assertEqual(JSON.stringify(knob.enum), '[1,2]', 'exactly the two ADR-0011 tiers');
+  assert(!('default' in knob), 'no default — absence is the fail-closed state (tier 1)');
+  assert(/ADR-0011/.test(knob.description), 'the description points at the decision');
+  assert(/autonomous/.test(knob.description), 'and says what tier 2 unlocks');
 });
 
 test('cli: autonomy set agent.provider codex writes and validates; enums enforced', () => {

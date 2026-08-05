@@ -258,6 +258,34 @@ test('decideMerge: an out-of-range trust level fails closed', () => {
   assert(d.reason.includes('failing closed'));
 });
 
+// --- stage 36: escalate is a tagged, never-merging non-approve verdict ----------
+
+test('decideMerge: an escalate verdict gates and is TAGGED escalate, never merging at any trust', () => {
+  for (const trustLevel of [0, 1, 2]) {
+    const d = trust.decideMerge('escalate', trustLevel, LOW, true);
+    assertEqual(d.merge, false, `escalate never merges at trust ${trustLevel}`);
+    assertEqual(d.gate, true, `escalate gates at trust ${trustLevel}`);
+    assertEqual(d.escalate, true, `escalate decision is tagged at trust ${trustLevel}`);
+    assert(d.reason.includes('escalate'), 'reason names the verdict');
+  }
+});
+
+test('decideMerge: request_changes / unknown / absent gate with NO escalate tag (byte-identical default)', () => {
+  for (const trustLevel of [0, 1, 2]) {
+    for (const verdict of ['request_changes', 'reject', null, undefined]) {
+      const d = trust.decideMerge(verdict, trustLevel, LOW, true);
+      assertEqual(d.merge, false, `verdict ${verdict} trust ${trustLevel} never merges`);
+      assertEqual(d.gate, true, `verdict ${verdict} trust ${trustLevel} gates`);
+      assertEqual(
+        d.escalate,
+        undefined,
+        `verdict ${verdict} carries NO escalate field (unchanged from pre-stage-36)`,
+      );
+      assert(d.reason.includes('is not approve'), 'keeps the generic fail-closed reason');
+    }
+  }
+});
+
 // --- merge + checksGreen --------------------------------------------------------
 
 test('merge: issues exactly `gh pr merge <n> --squash`', () => {

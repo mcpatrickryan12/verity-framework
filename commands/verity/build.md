@@ -17,7 +17,10 @@ green PR — this role NEVER merges (the builder must not merge its own work).
 </objective>
 
 <process>
-1. Load the stage + confirm it is unblocked:
+1. Load the stage + confirm it is unblocked. If this prompt carries a
+   Verity-rendered GitHub state snapshot (contained runs — ADR-0013), read the
+   stage status, dependency state, and unblocked list from it instead of
+   running these commands:
    ```bash
    verity state stage $ARGUMENTS      # status + depends-on
    verity state next                  # must include this stage (its deps are merged)
@@ -60,7 +63,9 @@ green PR — this role NEVER merges (the builder must not merge its own work).
    ```bash
    verity state stage $ARGUMENTS      # status -> in-review when CI is green
    ```
-   **Done = PR open + CI all-green.**
+   Contained runs cannot watch CI (the state snapshot is point-in-time):
+   finish your file changes and report — Verity's own post-run checks are what
+   verify CI, and the worker re-dispatches on red. **Done = PR open + CI all-green.**
 
 7. Hand off to **/verity:review** for the merge. Do NOT merge.
 </process>

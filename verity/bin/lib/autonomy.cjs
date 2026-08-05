@@ -49,6 +49,13 @@ const DEFAULTS = {
   gates: ['review:merge', 'ship:prod', 'golive'],
   review: {
     trust: 0,
+    // Stage 36 (issue #91) — ADDITIVE and DEFAULT-OFF: when true, a review
+    // `escalate` verdict PARKS the work item for a human (applies
+    // verity:needs-human to the anchor + names the next role in the gate)
+    // instead of routing like request_changes. Absent/false is the closed
+    // state — an escalate verdict then gates exactly as request_changes, so the
+    // feature dark-launches byte-identically to pre-stage-36 behavior.
+    escalate_routing: false,
     low_risk: {
       max_changed_lines: 150,
       allowed_paths: ['docs/**', 'tests/**', '**/*.md'],
@@ -351,6 +358,10 @@ const SPEC = {
     type: 'map',
     keys: {
       trust: { type: 'int', min: 0, max: 2 },
+      // Stage 36 (issue #91): route an `escalate` review verdict to a human
+      // (verity:needs-human on the anchor) instead of a generic gate. Default
+      // false (see DEFAULTS) — a dark-launched kill-switch.
+      escalate_routing: { type: 'boolean' },
       low_risk: {
         type: 'map',
         keys: {
@@ -374,6 +385,19 @@ const SPEC = {
         type: 'enum',
         values: ['gate', 'allow_with_token_limit', 'fail'],
       },
+      // Stage 19 (issue #50) — ADDITIVE and DEFAULT-ABSENT, like
+      // agent.acknowledged_enforcement_gaps and agent.containment_tier: it is
+      // deliberately NOT in DEFAULTS, so absence is the closed state and every
+      // pre-stage-19 policy behaves identically. What the worker does when a
+      // PR's CI is UNVERIFIABLE (GitHub reports no checks at all — the
+      // repository may have no CI). Absent/'gate' pauses at the ci:unverified
+      // human gate; 'allow_without_merge' lets the stage advance to review for
+      // repositories that legitimately have no CI. Neither value can merge on
+      // unverified CI — the merge gate demands a VERIFIED green reading.
+      unverified_ci_behavior: {
+        type: 'enum',
+        values: ['gate', 'allow_without_merge'],
+      },
     },
   },
   notify: {
@@ -396,6 +420,22 @@ const SPEC = {
       approval: { type: 'enumOrNull', values: ['untrusted', 'on-request', 'never'] },
       ignore_user_config: { type: 'boolean' },
       ignore_rules: { type: 'boolean' },
+      // Stage 11 (ADR-0011 capability honesty rule) — ADDITIVE and
+      // DEFAULT-ABSENT: the operator's explicit, auditable acknowledgement
+      // that a capability the role restricts has NO enforcing mechanism on
+      // the selected provider (today: `network`). Absent = nothing
+      // acknowledged = such a role is REFUSED (exit 30
+      // `unenforceable-policy`), which is the fail-closed default. Listing a
+      // capability here does not grant it — it records that Verity does not
+      // enforce its denial, and the run's result carries that admission.
+      acknowledged_enforcement_gaps: { type: 'stringList' },
+      // Stage 14 (ADR-0011 tier 2) — ADDITIVE and DEFAULT-ABSENT: which
+      // containment tier the worker demands of every codex dispatch. Absent =
+      // tier 1 (credential stripping + post-run invariants), the guarantee
+      // already shipped and proven; `2` additionally runs each role in a
+      // disposable shaped workspace and gates what may propagate back.
+      // UNATTENDED codex autonomy (`mode: autonomous`) is REFUSED below 2.
+      containment_tier: { type: 'enum', values: [1, 2] },
     },
   },
 };
@@ -489,6 +529,25 @@ function validatePolicy(policy) {
           `agent.${knob}: only meaningful with agent.provider codex — set the provider first or remove the override`,
         );
       }
+    }
+    // Same rule for the stage-11 acknowledgement knob: claude's restrictions
+    // are enforced by its own harness allowlist, so it has no gap to
+    // acknowledge and a non-empty list would be a config the operator
+    // believes does something. An empty list is the default-absent state.
+    if (
+      Array.isArray(agent.acknowledged_enforcement_gaps) &&
+      agent.acknowledged_enforcement_gaps.length > 0
+    ) {
+      errors.push(
+        'agent.acknowledged_enforcement_gaps: only meaningful with agent.provider codex — claude restrictions are enforced by its own harness allowlist (ADR-0011)',
+      );
+    }
+    // Same rule for the tier knob (stage 14): claude has no containment tiers,
+    // so any value here would be a config the operator believes did something.
+    if (agent.containment_tier !== undefined && agent.containment_tier !== null) {
+      errors.push(
+        'agent.containment_tier: only meaningful with agent.provider codex — claude has no ADR-0011 containment tiers (its write-time restriction is enforced by its own harness allowlist)',
+      );
     }
   }
   return errors;
@@ -700,9 +759,72 @@ function setValue(cwd, dotted, rawValue, flags = {}) {
   return { ok: true, key: dotted, value, path: file, adr: adrRecord, raw: `${dotted}=${value}` };
 }
 
+// Stage 26 (ADR-0011): the roles the WORKER can dispatch — P4 synthesizes
+// 'plan' (worker/index.cjs), the dependency engine plans 'build'/'review'
+// (next.cjs). `validate` cross-checks THIS set because "valid" is a statement
+// about what the worker will do with the policy, and the canary caught it
+// blessing a codex policy every one of these dispatches then refused.
+const WORKER_DISPATCH_ROLES = ['build', 'plan', 'review'];
+
+// The validate-time half of the capability honesty rule. The DISPATCH gate
+// (agents/policy.cjs assertEnforceable, exit 30 `unenforceable-policy`) is the
+// authority; this check exists so `verity autonomy validate` never contradicts
+// it — a codex policy whose worker-dispatchable roles declare a restriction no
+// mechanism enforces, without the operator's acknowledgement, is flagged HERE
+// instead of discovered one refused dispatch at a time. Returns error strings
+// in validatePolicy's format.
+function enforcementGapErrors(cwd, policy) {
+  const agent = policy.agent;
+  if (!isPlainObject(agent) || agent.provider !== 'codex') {
+    return []; // claude restrictions are enforced by its own harness allowlist
+  }
+  const acknowledged = Array.isArray(agent.acknowledged_enforcement_gaps)
+    ? agent.acknowledged_enforcement_gaps
+    : [];
+  // Lazy requires, same as doctor.cjs: only this verb needs the role-policy
+  // machinery, and the module's zero-heavy-import load path stays unchanged.
+  const { resolveRole } = require('./agent-exec.cjs');
+  const rolePolicy = require('./agents/policy.cjs');
+  const byGap = new Map();
+  for (const role of WORKER_DISPATCH_ROLES) {
+    const resolved = resolveRole(cwd, role);
+    if (resolved === null) {
+      continue;
+    }
+    let loaded;
+    try {
+      loaded = rolePolicy.loadPolicy(resolved.permissionsFile);
+    } catch {
+      // A missing/invalid role policy is the dispatch path's own fail-closed
+      // refusal (exit 30 missing-policy/bad-policy) — not this check's claim.
+      continue;
+    }
+    for (const gap of rolePolicy.enforcementGaps(loaded)) {
+      if (acknowledged.includes(gap)) {
+        continue;
+      }
+      if (!byGap.has(gap)) {
+        byGap.set(gap, []);
+      }
+      byGap.get(gap).push(role);
+    }
+  }
+  return [...byGap.keys()].sort().map((gap) => {
+    const roles = byGap.get(gap).sort().join(', ');
+    return `agent.acknowledged_enforcement_gaps: role(s) ${roles} declare ${gap}: false, which NO mechanism enforces on codex — the worker would refuse every such dispatch (exit 30 unenforceable-policy) rather than appear to enforce it (ADR-0011); acknowledge the gap explicitly with agent.acknowledged_enforcement_gaps: [${gap}] to run anyway, with the gap recorded in each run's result`;
+  });
+}
+
 function validateFile(cwd) {
   const user = readUserPolicy(cwd); // PolicyError(+line) on malformed YAML → exit 20
-  const errors = validatePolicy(deepMerge(clone(DEFAULTS), user.data));
+  const merged = deepMerge(clone(DEFAULTS), user.data);
+  const errors = validatePolicy(merged);
+  // The honesty cross-check runs only on a structurally valid policy — a
+  // schema violation is already a refusal, and gap analysis of a malformed
+  // agent block would be noise on top of it.
+  if (errors.length === 0) {
+    errors.push(...enforcementGapErrors(cwd, merged));
+  }
   if (errors.length > 0) {
     throw new PolicyError(`invalid autonomy policy (${user.path}): ${errors.join('; ')}`);
   }

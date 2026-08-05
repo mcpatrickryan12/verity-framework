@@ -22,8 +22,11 @@ node -v && git --version && gh auth status
 npm i -g verity-framework
 
 # connect it to your assistant:
-verity install --claude        # or: --opencode
+verity install --claude        # or: --opencode | --codex
 ```
+
+> On the **Codex CLI**? The install flag, invocation syntax, and autonomy limits
+> differ — see [Codex CLI](#codex-cli) below.
 
 > Autonomy is opt-in and off by default — you get the hand-driven roles out of
 > the box; enable the headless worker later with `/verity:autonomy-setup`.
@@ -127,6 +130,89 @@ and records it as an ADR. See the [README](README.md#deployment-methods).
   no merge tool.
 - **Bot-attributed & audited** — a dedicated machine user does the work; every action leaves
   a comment and a ledger row.
+
+---
+
+## Codex CLI
+
+Verity also runs on the **Codex CLI**. Everything above applies, with three
+differences: the install flag, the invocation syntax, and where autonomy is (and
+isn't) available.
+
+```bash
+npm i -g verity-framework
+verity install --codex               # skills → ~/.agents/skills/verity-<role>/
+verity doctor --agent codex          # checks git, gh + auth, codex + auth, skills, engine
+```
+
+Then, inside Codex, invoke a role **explicitly** — never `/verity:*`, and roles
+never activate implicitly:
+
+```
+$verity-vision
+```
+
+Confirm Codex lists the skills with `/skills`.
+
+### Autonomy status on Codex
+
+Honest per-capability status (matching the v1.1.0 release-notes classification):
+
+| Capability | Status | How |
+|---|---|---|
+| Interactive roles | Supported | `$verity-vision`, … inside Codex |
+| Headless single-role | Supported | `verity agent-exec <role> --agent codex` — tier-1 containment verified on the real binary |
+| Supervised local autonomy | Supported | worker with `mode: supervised`, `review.trust: 0`, `agent.provider: codex` |
+| Unattended local autonomy | Opt-in, **default OFF** | `mode: autonomous` requires `agent.containment_tier: 2`; refused below it |
+| GitHub Actions autonomy | **Deferred — local only** | ADR-0009 — never reuse local ChatGPT/Codex auth in Actions |
+
+### Supervised local autonomy — minimal `.verity/autonomy.yml`
+
+```yaml
+mode: supervised          # the worker runs the roles; every PR gates for a human
+review:
+  trust: 0                # the worker never merges on its own
+agent:
+  provider: codex
+  acknowledged_enforcement_gaps: [network]
+```
+
+Why `acknowledged_enforcement_gaps: [network]`? `codex exec` cannot enforce
+`network: false` — nothing on Codex does. Rather than *appear* to enforce a
+restriction it can't, Verity's honesty gate **refuses** the dispatch (exit 30
+`unenforceable-policy`) unless you acknowledge the gap explicitly; acknowledging
+it records the gap in every run's result (ADR-0011).
+
+**Unattended (`mode: autonomous`)** is available only behind opt-in **tier-2**
+containment — add `agent.containment_tier: 2` (a disposable, shaped workspace
+with gated merge-back). Without it the worker refuses the run
+(`verity-worker: 30 containment-tier-required`). It is **off by default**.
+
+> **GitHub Actions is deferred for Codex — local only (ADR-0009).** Run the Codex
+> worker on a machine where you're logged in with `codex login`. Never copy local
+> ChatGPT/Codex auth material into Actions secrets.
+
+**How Codex is kept safe — containment, not enforcement.** Claude's
+`--allowed-tools` allowlist is enforced by its own harness at write time. Codex
+has no such primitive — `codex exec` ignores permission profiles — so Verity
+*contains* Codex runs instead: the child process is built from an enumerated
+credential passlist (secrets stripped), the worktree is diffed against protected
+paths after every role, and unattended runs add a tier-2 disposable workspace
+with gated merge-back. Verity owns the guarantee; Codex is not trusted to enforce
+the role policy.
+
+### Troubleshooting `verity doctor --agent codex`
+
+Each failing row names its own remediation command; the common ones:
+
+| Symptom | What it means | Fix |
+|---|---|---|
+| `codex not runnable … is it installed and on PATH?` | Codex CLI missing | `npm install -g @openai/codex` |
+| `codex X is below the configured minimum …` | Below the feature-derived version pin (currently 0.146.0) | `npm install -g @openai/codex@latest` |
+| `codex … present but \`codex login status\` failed` | Not authenticated | `codex login` |
+| `Verity skills missing: N/M verity-* skills …` | Roles not installed for Codex | `verity install --codex` |
+| `engine internals missing …` | Deterministic CLI unreachable from the skills | `verity install --codex` |
+| `stale install state: harness is '…'` | `~/.agents` isn't a Codex install | `verity install --codex` |
 
 ---
 

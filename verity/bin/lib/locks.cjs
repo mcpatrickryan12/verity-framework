@@ -43,6 +43,7 @@
 //   release(item, {runId, outcome, repo, ...ghOpts})        // never throws
 //   isFreshlyLocked(item, {now, comments, repo, ...ghOpts}) -> boolean
 //   countFailures(item, {comments, repo, ...ghOpts})        -> number
+//   readComments(item, {repo, ...ghOpts})                   -> comment[]
 // `item` = number | {number, repo?, ...}. `comments` (pre-fetched array of
 // comment objects or body strings) lets the scanner decide without N+1 fetches.
 // Pure helpers exported for tests/consumers: parseLockEvent, lockState,
@@ -123,6 +124,14 @@ function fetchComments(item, opts) {
     }
   }
   return all;
+}
+
+// The paginated comment stream for an item, exposed so a consumer that needs
+// the item's own history (stage 19's no-progress strike reads the worker's §7
+// run summaries) does not re-implement pagination or bypass the gh layer. Pure
+// read: no labels, no comments, no lock semantics.
+function readComments(item, opts = {}) {
+  return fetchComments(item, opts);
 }
 
 function lockCommentBody(runId, expiresIso, reclaimedFrom) {
@@ -313,6 +322,7 @@ module.exports = {
   release,
   isFreshlyLocked,
   countFailures,
+  readComments,
   // pure helpers / constants (used by tests and by T08/T10 for parsing)
   parseLockEvent,
   lockState,

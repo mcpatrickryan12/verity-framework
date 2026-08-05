@@ -1,4 +1,4 @@
 {"type":"thread.started","thread_id":"th_004"}
 {"type":"turn.started"}
-{"type":"item.started","item":{"id":"item_0","item_type":"command_execution","command":"npm test","status":"in_progress"}}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"npm test","status":"in_progress"}}
 {"type":"turn.failed","error":{"message":"stream disconnected before completion"}}

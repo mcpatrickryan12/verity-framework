@@ -1,7 +1,33 @@
 # Contributing to Verity
 
-Thanks for your interest in improving Verity. This guide covers the local setup,
-how to run the checks, and the conventions that keep the codebase consistent.
+Thanks for your interest in improving Verity. This guide covers how changes
+reach the project, the local setup, how to run the checks, and the conventions
+that keep the codebase consistent.
+
+## How changes reach Verity
+
+The public repository ([seanerama/verity-framework](https://github.com/seanerama/verity-framework))
+is Verity's **production home** — the front door of the project and the place
+releases are tagged and published from.
+
+- **Issues are the way in — and they're welcome.** Bug reports, feature
+  requests, doc fixes, sharp questions: open an issue on the production repo.
+  Issues flow directly into development triage, and a well-written one
+  regularly becomes the next release's work. If you have a concrete change in
+  mind, describing it (or sketching it) in an issue is the fastest way to get
+  it shipped.
+- **Code does not land via pull requests to the production repo.** Source
+  changes travel through a separate development repository and arrive in the
+  production repo as **promoted releases**: each release is a single commit
+  produced by a deterministic, fail-closed projection of the development tree,
+  then tagged and published. `RELEASE-MANIFEST.json` at the repo root carries
+  each release's provenance (version, per-file digests, package shasum).
+- Changelog references of the form `dev#NN` point at issues/PRs in the
+  development repository; issue numbers in the production repo are unrelated
+  to them.
+
+Everything below serves anyone running the public tree locally — to reproduce
+a bug before filing it, to verify a fix landed, or just to poke at the engine.
 
 ## Prerequisites
 
@@ -45,7 +71,8 @@ every `tests/*.test.cjs`, injects three globals — `test`, `assert`, `assertEqu
 runs them, and exits non-zero on any failure. It **refuses a vacuous pass**: if no
 test files exist, it fails.
 
-Add a test by dropping a new file in `tests/`:
+A test is just a file in `tests/` (useful for reproducing a bug locally —
+include the failing test in your issue and it will likely ship with the fix):
 
 ```js
 // tests/my-thing.test.cjs
@@ -78,7 +105,7 @@ verity/
   templates/*.tmpl      files the scaffolder writes into a new project
   design-guides/*.md    built-in architecture guides the Architect role offers
 commands/verity/*.md    the 15 role slash commands (the public surface)
-docs/                   public docs, specs, and the interactive HTML guides
+docs/                   public docs and specs
 tests/*.test.cjs        the suite
 scripts/run-tests.cjs   the runner
 ```
@@ -96,13 +123,6 @@ scripts/run-tests.cjs   the runner
   `verity` CLI calls. See [`docs/commands.md`](docs/commands.md) for the full map.
 - **No new runtime dependencies.** The package ships with zero runtime deps;
   please keep it that way unless there's a strong reason to discuss.
-
-## Submitting changes
-
-1. Branch off `main`.
-2. Make the change with a test that covers it.
-3. Ensure `npm test && npm run lint` are both green.
-4. Open a PR with a clear description of the *why*, not just the *what*.
 
 ## Design background
 

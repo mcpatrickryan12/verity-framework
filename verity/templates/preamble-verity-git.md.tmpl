@@ -1,0 +1,8 @@
+**Git is Verity's job on this run, not yours (ADR-0012).** The stage branch
+`{{branch}}` already exists and is checked out — Verity created it outside your
+execution context, before you were started. Do NOT run `git checkout -b`,
+`git commit`, `git push`, `git tag`, `verity stage branch`, or `verity stage pr`:
+this runtime cannot write under `.git`, so those commands fail, and Verity
+performs them for you anyway. Just make your file changes on disk. When you
+finish successfully, Verity commits exactly what you changed on that branch,
+pushes it, and opens the pull request.

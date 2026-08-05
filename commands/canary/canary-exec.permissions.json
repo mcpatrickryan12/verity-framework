@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "capabilities": {
+    "read_repository": true,
+    "write_repository": true,
+    "run_tests": false,
+    "git_read": false,
+    "git_write": false,
+    "github_read": false,
+    "github_write": false,
+    "network": false,
+    "deploy": false,
+    "write_protected_paths": false
+  },
+  "codex": {
+    "sandbox": "workspace-write",
+    "approval": "never",
+    "ignore_user_config": true,
+    "ignore_rules": false
+  }
+}

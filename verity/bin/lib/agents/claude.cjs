@@ -28,9 +28,13 @@ const { renderRole } = require('../install.cjs');
 const { AgentExecError, RESULT_CONTRACT, extractMarker, isPlainObject } =
   require('./result-contract.cjs');
 
-const PKG = require('../../../../package.json');
+// Version floor from the IN-SUBTREE engine-meta.json (stage 35), not a top-level
+// `require('../../../../package.json')` above the engine root (which crashed a
+// copied engine at load). The hardcoded `'2.1.170'` stays the honest fallback
+// for a stale pre-fix copy with no engine-meta.json.
+const engineMeta = require('../engine-meta.cjs');
 
-const MIN_CLAUDE_VERSION = PKG.verity?.claudeCodeMinVersion || '2.1.170';
+const MIN_CLAUDE_VERSION = engineMeta.load().verity?.claudeCodeMinVersion || '2.1.170';
 const DEFAULT_BINARY = 'claude';
 
 function firstLine(text) {

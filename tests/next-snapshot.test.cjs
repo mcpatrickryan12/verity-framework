@@ -47,7 +47,8 @@ const PRS = [
 ];
 
 // A fake `gh` placed first on PATH. `mode: 'online'` serves the canned state;
-// `mode: 'offline'` always fails (ledger degrades to the empty snapshot).
+// `mode: 'offline'` always fails (stage 20: the ledger REFUSES rather than
+// degrade to an empty snapshot — see the offline test at the bottom).
 function stubGh(dir, mode) {
   const bin = path.join(dir, 'stub-bin');
   fs.mkdirSync(bin, { recursive: true });
@@ -132,10 +133,45 @@ test('SNAPSHOT: state view (full projection) is byte-identical', () => {
   assertEqual(online.run(['state', 'view']), `${JSON.stringify(expected, null, 2)}\n`);
 });
 
-test('SNAPSHOT: offline/idle — gh unavailable degrades to all-planned, roots next', () => {
+// DELIBERATELY MOVED IN STAGE 20 (issue #60) — read this before "fixing" it.
+//
+// This assertion used to read:
+//
+//   test('SNAPSHOT: offline/idle — gh unavailable degrades to all-planned, roots next')
+//     state next          -> {"next":[1],"raw":"[1]"}          exit 0
+//     state summary --raw -> 3 stages · release (none) · next [1]
+//
+// It was pinning the DEFECT, not a behavior worth preserving: with `gh`
+// unreachable the ledger emitted a confident empty state at exit 0 with an
+// empty stderr, indistinguishable from a repository where nothing has started.
+// Canary run 3 believed it — the `review` role was told "no PR or linked issue
+// exists" while PR #2 was open. A snapshot test's job is to catch unintended
+// change; when the pinned bytes are themselves the bug, the bytes are what
+// move, and the move is written down here rather than regenerated in silence.
+//
+// What did NOT move: every online assertion above, byte for byte. The fix
+// touches only the path that previously produced a falsehood.
+test('SNAPSHOT: offline — gh unavailable now REFUSES (stage 20; this replaced all-planned)', () => {
   const offline = fixture('offline');
-  assertEqual(offline.run(['state', 'next']), '{\n  "next": [\n    1\n  ],\n  "raw": "[1]"\n}\n');
-  assertEqual(offline.run(['state', 'summary', '--raw']), '3 stages · release (none) · next [1]\n');
+  for (const args of [
+    ['state', 'next'],
+    ['state', 'summary', '--raw'],
+    ['state', 'view'],
+  ]) {
+    let code = 0;
+    let out = '';
+    let stderr = '';
+    try {
+      out = offline.run(args);
+    } catch (err) {
+      code = err.status;
+      out = err.stdout || '';
+      stderr = err.stderr || '';
+    }
+    assertEqual(code, 30, `${args.join(' ')} must exit 30, not answer from an unread snapshot`);
+    assertEqual(out, '', `${args.join(' ')} must print no projection at all`);
+    assert(stderr.includes('could not look'), `and must say why on stderr, got: ${stderr}`);
+  }
 });
 
 test('snapshot outputs are machine-independent (no absolute paths leak)', () => {

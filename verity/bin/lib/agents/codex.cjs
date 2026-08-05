@@ -4,9 +4,12 @@
 // through the ./index.cjs registry, only on an explicit `--agent codex`
 // (the default agent remains claude — worker selection is stage 9).
 //
-// Invocation shape (codex-support.md §9.4; ADR-0007 explicit-config rule):
+// Invocation shape (codex-support.md §9.4; ADR-0007 explicit-config rule;
+// stage 10 CDX-002/003 realignment to the documented CLI; stage 15 #34 removed
+// --output-schema — see buildArgv):
 //   codex exec --json --sandbox <from policy> --output-last-message <file>
-//     --cd <repo root> -c approval_policy="never" [-c ignore_user_config=true] -
+//     --cd <repo root>
+//     -c approval_policy="never" [--ignore-user-config] [--ignore-rules] -
 // with the rendered prompt delivered over STDIN (§9.3 — no argv length limits,
 // no prompt in process listings). The real Codex CLI is not available in CI,
 // so these spellings are pinned by the stub-driven suite and MUST be
@@ -38,15 +41,36 @@ const {
   isPlainObject,
   validateRoleOutcome,
 } = require('./result-contract.cjs');
-const { applyOverrides: applyPolicyOverrides, loadPolicy } = require('./policy.cjs');
+// The required-feature matrix (stage 12) — the evidence the version pin is
+// DERIVED from, shared with doctor.cjs so a diagnosis can name the feature that
+// motivates the minimum instead of just quoting a number.
+const features = require('./codex-features.cjs');
+const gitLifecycle = require('./git-lifecycle.cjs');
+const invariants = require('./invariants.cjs');
+const stateSnapshotLib = require('./state-snapshot.cjs');
+const {
+  applyOverrides: applyPolicyOverrides,
+  assertEnforceable,
+  loadPolicy,
+} = require('./policy.cjs');
+const workspace = require('./workspace.cjs');
 
-const PKG = require('../../../../package.json');
+// Version floor from the IN-SUBTREE engine-meta.json (stage 35), not a top-level
+// `require('../../../../package.json')` above the engine root (which crashed a
+// copied engine at load). engine-meta.json is stamped from package.json at
+// install/copy time, so the operator-visible knob is still package.json.
+const engineMeta = require('../engine-meta.cjs');
 
-// Pinned against the Codex CLI release line feature-tested for the flags this
-// driver depends on — `exec`, `--json`, `--sandbox`, `--output-last-message`,
-// `login status` (codex-support.md §9.2) — not against "today's version".
-// The manual canary re-verifies the pin on every release that touches this file.
-const MIN_CODEX_VERSION = PKG.verity?.codexMinVersion || '0.42.0';
+// FEATURE-DERIVED, not historical (stage 12). The pin is the highest VERIFIED
+// row of the required-feature matrix (./codex-features.cjs) — the newest release
+// where a feature this driver depends on was actually observed working. It is
+// conservative BY EVIDENCE: the spike never bisected backwards, so older
+// releases may work fine; Verity just does not claim what it has not seen. The
+// package.json key stays the operator-visible knob; the matrix is the reason it
+// holds the value it does, and a test pins the two together so neither drifts.
+// `features.verifiedFloor()` stays the honest fallback for a stale pre-fix copy
+// with no engine-meta.json.
+const MIN_CODEX_VERSION = engineMeta.load().verity?.codexMinVersion || features.verifiedFloor();
 const DEFAULT_BINARY = 'codex';
 
 // Deterministic tool-call counting (codex-support.md §9.6): count the START of
@@ -55,10 +79,59 @@ const DEFAULT_BINARY = 'codex';
 // not tool calls and are never counted.
 const TOOL_ITEM_TYPES = ['command_execution', 'file_change', 'mcp_tool_call', 'web_search'];
 
-function firstLine(text) {
+// --- provider failure text (stage 15, issue #35) ---------------------------------
+// Every provider failure reaches the result through failureText(). It replaced
+// a firstLine() that took the first PHYSICAL line of the provider's message —
+// fine for the one-line messages the doc-derived fixtures carry, useless for
+// what the real API actually returns. The 400 that broke every codex run
+// (issue #34) is pretty-printed JSON whose first line is `{`, so the emitted
+// result was literally `error: "{"`: the defect breaking the path reported
+// itself as a lone brace, with nothing an operator could act on.
+//
+// Rules: a message that parses as JSON surfaces its meaningful field
+// (`.error.message`, else `.message`) — and again if THAT is itself JSON,
+// which the real `error` event does; anything else collapses whitespace into
+// one bounded line. A lone punctuation character is never emitted.
+const FAILURE_TEXT_MAX = 400;
+// How many times a message-in-a-message may be unwrapped. The real payload
+// needs one hop; the bound just stops a pathological transcript from looping.
+const FAILURE_UNWRAP_LIMIT = 3;
+
+function collapse(text) {
   return String(text || '')
-    .split('\n')
-    .find((l) => l.trim().length > 0);
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function bounded(text) {
+  return text.length > FAILURE_TEXT_MAX ? `${text.slice(0, FAILURE_TEXT_MAX)}…` : text;
+}
+
+function failureText(raw) {
+  let text = raw;
+  for (let hop = 0; hop < FAILURE_UNWRAP_LIMIT; hop += 1) {
+    const obj = wholeJsonObject(text);
+    if (obj === null) {
+      break;
+    }
+    const inner =
+      (isPlainObject(obj.error) && typeof obj.error.message === 'string' && obj.error.message) ||
+      (typeof obj.message === 'string' && obj.message) ||
+      null;
+    if (inner === null) {
+      break; // JSON without a message field — the collapsed blob is still legible
+    }
+    text = inner;
+  }
+  const flat = bounded(collapse(text));
+  // Fail-safe on the never-a-lone-brace rule: if unwrapping produced something
+  // with no substance, fall back to the whole original message rather than
+  // emitting punctuation as an error.
+  if (/[A-Za-z0-9]/.test(flat)) {
+    return flat;
+  }
+  const whole = bounded(collapse(raw));
+  return /[A-Za-z0-9]/.test(whole) ? whole : 'provider failure with no message text';
 }
 
 // Binary override precedence (codex-support.md §8.5, same ladder as claude):
@@ -90,10 +163,13 @@ function checkVersion(bin, opts = {}) {
     };
   }
   if (check.why === 'too-old') {
+    // Name the FEATURE, not just the number (stage 12): "upgrade" without a
+    // reason is the kind of pin nobody can audit — which is how 0.42.0 survived
+    // three stages. Same rationale string `verity doctor --agent codex` prints.
     return {
       ok: false,
       slug: 'version-too-old',
-      error: `Codex CLI ${check.version} is below the pinned minimum ${MIN_CODEX_VERSION} — upgrade the Codex CLI`,
+      error: `Codex CLI ${check.version} is below the pinned minimum ${MIN_CODEX_VERSION} — upgrade the Codex CLI (${features.pinMotivation()})`,
     };
   }
   const exec = opts.exec || spawnSync;
@@ -135,34 +211,30 @@ function finalMessageFilename(role) {
   return `${role}.final.json`;
 }
 
-function rulesFilename(role) {
-  return `${role}.rules.json`;
-}
-
-// --- ADR-0007 enforcement projection (stage 9) --------------------------------
-// "Generate Codex command rules from `.permissions.json`" — the sandbox alone
-// is one blunt tier; these generated rules carry the per-role differentiation.
-// Derivation is deterministic and capability-driven:
-//   writable_roots            the repo root is the ONLY writable root under
-//                             workspace-write (denial: writes outside the
-//                             repo/work roots); read-only writes nothing
-//   network                   straight from capabilities.network
-//   denied_read_paths         credential-shaped locations, ALWAYS denied — no
-//                             capability grants credential reads
-//   denied_write_paths        the protected config roots (.github/, .verity/)
-//                             unless the role explicitly holds the additive
-//                             write_protected_paths capability
-//   denied_command_prefixes   merge authority is ALWAYS denied (T13 — the
-//                             worker merges, never a role), plus per-missing-
-//                             capability denials: deploy covers the denied
-//                             deploy commands AND the gate-bypassing
-//                             later-lifecycle commands (`verity release`);
-//                             git_write / github_write cover their mutations
-// One rules document is written per invocation into the run log dir and
-// delivered as `-c rules_file=<path>`. The delivery spelling is pinned by the
-// stub suite; the manual canary MUST re-verify it against the pinned real
-// release (rules may need to live under CODEX_HOME/rules instead — fix
-// buildArgv + the stubs + the canary doc together, in one commit).
+// --- ADR-0011 tier-1 containment: policy DATA -----------------------------------
+// These four tables used to be projected into a generated JSON denial document
+// handed to Codex as a `-c` config key. The stage-11 spike proved that
+// mechanism enforces NOTHING: the key is not one Codex defines (unknown `-c`
+// keys are silently absorbed), and real execpolicy denials cannot match the
+// `/bin/bash -lc '<cmd>'` form Codex actually runs commands as
+// (docs/dev/codex-enforcement-spike-0.146.0.md F3). The generation is DELETED —
+// shipping denials that never fire is security theater (ADR-0011).
+//
+// The tables survive as policy DATA for the mechanisms that do bind:
+//   CREDENTIAL_READ_DENIALS   the credential-shaped locations no capability
+//                             grants — documentation for the childEnv passlist
+//                             below and the canary's read-denial probes; the
+//                             tier-2 shaped workspace (stage 14) makes their
+//                             absence topological.
+//   PROTECTED_WRITE_PATHS     the roots the post-run invariant checker
+//                             snapshots and reverts (agents/invariants.cjs).
+//   MERGE_AUTHORITY_DENIALS   T13: merge authority lives in the worker, never
+//   CAPABILITY_COMMAND_DENIALS  in a role. Neither is a Codex-side denial any
+//                             more — merge authority is enforced by the
+//                             worker's own gate plus the absence of a GitHub
+//                             credential (childEnv), and the command families
+//                             document which capability each credential set
+//                             belongs to.
 const MERGE_AUTHORITY_DENIALS = ['gh pr merge'];
 const CAPABILITY_COMMAND_DENIALS = {
   deploy: ['gh release create', 'npm publish', 'scripts/deploy', 'verity release'],
@@ -199,36 +271,123 @@ const CREDENTIAL_READ_DENIALS = [
 ];
 const PROTECTED_WRITE_PATHS = ['.github/', '.verity/'];
 
-function commandRules(policy, { cwd }) {
-  const caps = policy.capabilities;
-  const denied = new Set(MERGE_AUTHORITY_DENIALS);
-  for (const [capability, prefixes] of Object.entries(CAPABILITY_COMMAND_DENIALS)) {
-    if (caps[capability] !== true) {
-      for (const prefix of prefixes) {
-        denied.add(prefix);
-      }
+// --- credential stripping (ADR-0011 layer 2 — a PRIMARY mechanism) -------------
+// Before stage 11 `execute()` passed no `env` to spawnSync, so the Codex child
+// inherited the FULL parent environment — every token the operator (or CI) had
+// exported. Nothing about that was visible in the policy. The child environment
+// is now CONSTRUCTED: an enumerated baseline plus, per capability, exactly the
+// credentials that capability grants. Everything else — including anything
+// secret-shaped we have never heard of — is simply not there, and an absent
+// credential cannot be misused by any command, wrapped or not.
+//
+// Baseline passlist. Every entry is here because a shell/git/node/codex
+// toolchain cannot function without it; nothing is here "just in case".
+const BASELINE_ENV_PASSLIST = [
+  'PATH', // resolve the codex binary and everything the model runs
+  'HOME', // git config, ~/.codex auth, tool caches
+  'USER', // some tools refuse to run without an identity
+  'LOGNAME', // ditto (git falls back to it for the author name)
+  'SHELL', // Codex wraps model commands as `/bin/bash -lc` and reads this
+  'LANG', // text encoding — wrong value corrupts non-ASCII diffs
+  'LC_ALL', // ditto (overrides LANG)
+  'LC_CTYPE', // ditto (macOS defaults set only this)
+  'TERM', // terminal capabilities; absent TERM makes some tools hang
+  'TMPDIR', // where the child may write scratch files
+  'TMP', // TMPDIR's name on some platforms
+  'TEMP', // TMPDIR's name on some platforms
+  'CODEX_HOME', // Codex's own config/auth root (spike F5 — it carries auth)
+  'XDG_CONFIG_HOME', // config discovery for git/gh/node tooling
+  'XDG_CACHE_HOME', // cache location; absent, tools scatter into $HOME
+  'XDG_DATA_HOME', // data location, same reason
+  'SSL_CERT_FILE', // TLS trust store — without it the model API call fails
+  'SSL_CERT_DIR', // ditto
+  'NODE_EXTRA_CA_CERTS', // corporate TLS interception, same reason
+  'HTTP_PROXY', // egress path to the model API on proxied networks
+  'HTTPS_PROXY', // ditto
+  'NO_PROXY', // ditto (exclusions)
+  'http_proxy', // the lowercase spellings are what curl/git actually read
+  'https_proxy', // ditto
+  'no_proxy', // ditto
+  'ALL_PROXY', // ditto
+  'all_proxy', // ditto
+  // The Codex runtime's OWN credential. The child IS Codex: stripping this
+  // would refuse every run for API-key (rather than ChatGPT-login) users. It
+  // grants model access, which the role has by definition — it grants nothing
+  // about the repository, a remote, or any external system.
+  'OPENAI_API_KEY',
+];
+
+// Credentials, keyed by the capability that grants them. A capability the role
+// does not hold means the whole group is absent from the child environment.
+const CAPABILITY_CREDENTIALS = {
+  // GitHub write authority: without these `gh` cannot mutate anything on
+  // GitHub, whatever command the model types (or wraps in a shell).
+  github_write: ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'],
+  // Deploy / publish authority: cloud, registry, and PaaS credentials.
+  deploy: [
+    'AWS_ACCESS_KEY_ID',
+    'AWS_SECRET_ACCESS_KEY',
+    'AWS_SESSION_TOKEN',
+    'AWS_PROFILE',
+    'AZURE_CLIENT_ID',
+    'AZURE_CLIENT_SECRET',
+    'AZURE_TENANT_ID',
+    'CLOUDFLARE_API_TOKEN',
+    'DIGITALOCEAN_ACCESS_TOKEN',
+    'DOCKER_PASSWORD',
+    'DOCKER_USERNAME',
+    'FLY_API_TOKEN',
+    'GOOGLE_APPLICATION_CREDENTIALS',
+    'HEROKU_API_KEY',
+    'NETLIFY_AUTH_TOKEN',
+    'NODE_AUTH_TOKEN',
+    'NPM_TOKEN',
+    'RENDER_API_KEY',
+    'VERCEL_TOKEN',
+  ],
+};
+
+// Build the child environment from the passlist + the capability-granted
+// credential groups. Nothing else survives: this is an ALLOWLIST, so a
+// credential Verity has never heard of is dropped by construction rather than
+// by pattern-matching a name we guessed.
+function childEnv(policy, parentEnv = process.env) {
+  const caps = policy.capabilities || {};
+  const allowed = [...BASELINE_ENV_PASSLIST];
+  for (const [capability, names] of Object.entries(CAPABILITY_CREDENTIALS)) {
+    if (caps[capability] === true) {
+      allowed.push(...names);
     }
   }
-  return {
-    schema: 1,
-    sandbox: policy.codex.sandbox,
-    writable_roots: policy.codex.sandbox === 'workspace-write' ? [cwd] : [],
-    network: caps.network === true,
-    denied_command_prefixes: [...denied].sort(),
-    denied_read_paths: [...CREDENTIAL_READ_DENIALS],
-    denied_write_paths: caps.write_protected_paths === true ? [] : [...PROTECTED_WRITE_PATHS],
-  };
+  const env = {};
+  for (const name of allowed) {
+    if (parentEnv[name] !== undefined) {
+      env[name] = parentEnv[name];
+    }
+  }
+  return env;
 }
 
 // Additive contract annotations (agent-result v1.x optional fields) merged
 // into the emitted result object by the coordinator. Claude has no annotate()
 // so its output stays byte-identical.
+//
+// Called AFTER the run (stage 15, issue #36). It used to run before the spawn,
+// which meant `final_message_path` was computed before anything could have
+// written it: every failed run advertised a <role>.final.json that did not
+// exist (the real canary observed only <role>.codex.jsonl on disk). The field
+// is now emitted ONLY when the file is really there — explicitly permitted by
+// contracts/agent-result.md v1, which lists these as additive OPTIONAL fields
+// whose ABSENCE consumers must tolerate. `transcript_path` stays
+// unconditional: the driver streams stdout into it, so it always exists and
+// was always accurate.
 function annotate({ role, logDir }) {
+  const finalMessagePath = path.join(logDir, finalMessageFilename(role));
   return {
     provider: 'codex',
     timed_out: false,
     transcript_path: path.join(logDir, transcriptFilename(role)),
-    final_message_path: path.join(logDir, finalMessageFilename(role)),
+    ...(fs.existsSync(finalMessagePath) ? { final_message_path: finalMessagePath } : {}),
   };
 }
 
@@ -237,8 +396,33 @@ function annotate({ role, logDir }) {
 // rewrites $ARGUMENTS to its named placeholder — headless execution resolves
 // that placeholder here, exactly as agent-exec resolves $ARGUMENTS for
 // claude), then the shared headless result-contract footer.
-function renderPrompt(file, roleArgs) {
-  let text = renderRole(file, {}, 'codex');
+//
+// `ctx.git` (stage 17, ADR-0012) is the Verity-performed-git plan when there is
+// one. It flips the OPTION-KEYED `verityPerformsGit` preamble block on, so the
+// role is TOLD THE TRUTH about this run: the branch already exists, git is
+// Verity's job, and its job is to make file changes. The block is keyed on an
+// install option rather than on the host pass on purpose — an INSTALLED skill
+// is invoked interactively with no Verity orchestrating anything, so the claim
+// would be false there; keying it on the option also leaves every render golden
+// fixture (this host's included) byte-identical. Absent ctx.git the render is
+// exactly what it was before this stage.
+//
+// `ctx.state` (stage 24, ADR-0013) is the same mechanism one layer up: the
+// Verity-gathered GitHub state snapshot, when the dispatcher provided one. It
+// flips the `verityPerformsGitHub` preamble on — "GitHub is Verity's job on
+// this run": the facts the role's state reads would have fetched are rendered
+// in, and GitHub writes are declared in the result marker instead of
+// performed. Absent ctx.state the render is exactly what it was before.
+function renderPrompt(file, roleArgs, ctx = {}) {
+  const git = ctx.git === undefined || ctx.git === null ? null : ctx.git;
+  const state = ctx.state === undefined || ctx.state === null ? null : ctx.state;
+  const options = {
+    ...(git === null ? {} : { verityPerformsGit: true, branch: git.branch }),
+    ...(state === null
+      ? {}
+      : { verityPerformsGitHub: true, stateSnapshot: stateSnapshotLib.renderFacts(state) }),
+  };
+  let text = renderRole(file, options, 'codex');
   text = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
   const args = roleArgs.join(' ');
   text = text.split(CODEX_ARGUMENTS_PLACEHOLDER).join(args);
@@ -250,10 +434,24 @@ function renderPrompt(file, roleArgs) {
 // human is present) and, per ADR-0007's explicit-config rule, user-config
 // isolation is passed explicitly rather than inherited. The prompt is NOT
 // here: `-` reads it from stdin. Claude-only flags (--allowed-tools,
-// --max-turns, --output-format stream-json) never appear. Stage-9 additions:
-// the generated command-rules document (rulesPath) and an optional model
-// override — both omitted-in, so stage-8 argv is unchanged without them.
-function buildArgv({ policy, finalMessagePath, rulesPath, cwd, model }) {
+// --max-turns, --output-format stream-json) never appear. The stage-9
+// generated-denial-document `-c` branch is GONE (stage 11, ADR-0011 — it set a key
+// Codex does not define); `--model` remains omitted-in, so the argv without it
+// is unchanged.
+//
+// --output-schema is GONE too (stage 15, issue #34 — P0). Stage 10 wired it as
+// a "belt" on top of validateRoleOutcome, verified only by a stub. The real
+// canary (codex-cli 0.146.0, 2026-07-31) proved it kills EVERY run: our
+// schemas/agent-result.schema.json uses `allOf`, and the API answers HTTP 400
+// `invalid_json_schema: … 'allOf' is not permitted` → turn.failed, zero tokens,
+// zero tool calls. A/B on the real binary isolated the flag as the sole cause.
+// Result handling is back on the proven path — the --output-last-message file
+// parsed as structured JSON when present, else the RESULT_CONTRACT marker —
+// and NOTHING about validation weakens: validateRoleOutcome was always the
+// trust boundary, and the schema stays published as the contract artifact it
+// mirrors. (A flattened, allOf-free CLI-side schema is a deferred follow-up,
+// deliberately not attempted here.)
+function buildArgv({ policy, finalMessagePath, cwd, model }) {
   const argv = [
     'exec',
     '--json',
@@ -263,14 +461,23 @@ function buildArgv({ policy, finalMessagePath, rulesPath, cwd, model }) {
     finalMessagePath,
     '--cd',
     cwd,
+    // Spike-VERIFIED against codex-cli 0.146.0 (F6): `-c approval_policy=…`
+    // is accepted and honored by `codex exec` — the real run executed its
+    // commands with no prompt. The stage-10 SPIKE-UNVERIFIED marker is
+    // resolved; the canary re-verifies it on each version bump.
     '-c',
     `approval_policy=${JSON.stringify(policy.codex.approval)}`,
   ];
+  // Documented FLAGS, not `-c` keys (stage 10, CDX-002/003): the old
+  // `-c ignore_user_config=true` set a nonexistent config key that Codex
+  // silently absorbed — NO isolation. The `-c` spelling must never return
+  // (regression-pinned); `ignore_rules` was validated but never emitted at
+  // all until this stage.
   if (policy.codex.ignore_user_config) {
-    argv.push('-c', 'ignore_user_config=true');
+    argv.push('--ignore-user-config');
   }
-  if (rulesPath) {
-    argv.push('-c', `rules_file=${JSON.stringify(rulesPath)}`);
+  if (policy.codex.ignore_rules) {
+    argv.push('--ignore-rules');
   }
   if (model) {
     argv.push('--model', model);
@@ -286,17 +493,16 @@ function buildArgv({ policy, finalMessagePath, rulesPath, cwd, model }) {
 // partial transcript into a failure with timed_out: true.
 function execute({ bin, prompt, policy, cwd, transcript, logDir, role, timeoutSecs, model }) {
   const finalMessagePath = path.join(logDir, finalMessageFilename(role));
-  // ADR-0007: the enforcement projection travels with every invocation — the
-  // rules document is regenerated from the (possibly narrowed) policy each
-  // run, never cached, so it can't drift from what was actually loaded.
-  const rulesPath = path.join(logDir, rulesFilename(role));
-  fs.writeFileSync(rulesPath, `${JSON.stringify(commandRules(policy, { cwd }), null, 2)}\n`);
-  const argv = buildArgv({ policy, finalMessagePath, rulesPath, cwd, model });
+  const argv = buildArgv({ policy, finalMessagePath, cwd, model });
   const fd = fs.openSync(transcript, 'w');
   try {
     return spawnSync(bin, argv, {
       cwd,
       input: prompt,
+      // ADR-0011 layer 2: the child environment is CONSTRUCTED, never
+      // inherited. Passing no `env` here (what stage 8-10 did) handed the
+      // model every credential the parent process held.
+      env: childEnv(policy),
       stdio: ['pipe', fd, 'pipe'],
       encoding: 'utf8',
       maxBuffer: 16 * 1024 * 1024,
@@ -306,6 +512,127 @@ function execute({ bin, prompt, policy, cwd, transcript, logDir, role, timeoutSe
   } finally {
     fs.closeSync(fd);
   }
+}
+
+// --- ADR-0011 driver hooks the coordinator drives -------------------------------
+// A provider OPTS IN to tier-1 containment by exporting these. Claude does not:
+// its write-time restriction is enforced by its own harness allowlist, so its
+// path through agent-exec is byte-identical to before this stage.
+
+// Capability honesty (ADR-0011): refuse the run rather than appear to enforce a
+// restriction no mechanism binds. Returns the acknowledgements that actually
+// applied so the coordinator can surface them in the result.
+function checkEnforceable(policyBag, { acknowledged = [] } = {}) {
+  return assertEnforceable(policyBag.policy, acknowledged);
+}
+
+// Pre-run snapshot (protected roots + refs + worktree status). The protected
+// roots come from THIS driver's policy data, so the checker itself stays
+// provider-neutral.
+function captureInvariants({ cwd }) {
+  return invariants.capture(cwd, { protectedPaths: PROTECTED_WRITE_PATHS });
+}
+
+// Post-run: diff, hard-revert what is safely revertible, and hand the
+// coordinator a loud one-line error (or null on a clean run). Under tier 2
+// this runs against the REAL checkout AFTER merge-back — a cross-check that
+// the gate let nothing through, never the primary guarantee.
+function checkInvariants(before, policyBag) {
+  return invariants.enforce(before, policyBag.policy);
+}
+
+// --- ADR-0011 TIER 2 hooks (stage 14) -------------------------------------------
+// Declaring these is how a provider OPTS IN to the disposable shaped workspace
+// + gated merge-back. Claude declares neither, so `--containment-tier` is
+// rejected for it and its coordinator path is unchanged. The protected roots
+// come from THIS driver's policy data, so agents/workspace.cjs stays
+// provider-neutral.
+
+// Materialize the throwaway workspace the role actually runs in (`--cd` points
+// at it). Throws AgentExecError (exit 30 `workspace-unavailable`) rather than
+// degrading to the real checkout — tier 2 fails closed.
+function prepareWorkspace(policyBag, { cwd, dir, keep }) {
+  return workspace.prepare({
+    cwd,
+    dir,
+    keep,
+    policy: policyBag.policy,
+    protectedPaths: PROTECTED_WRITE_PATHS,
+  });
+}
+
+// Decide — deterministically, never with the model's help — what propagates
+// from the workspace back into the real repository.
+function mergeWorkspace(ws, policyBag) {
+  return workspace.merge(ws, policyBag.policy);
+}
+
+// Dispose of the workspace on every exit path (retained only under the
+// explicit debug flag). Never throws.
+function disposeWorkspace(ws) {
+  return workspace.cleanup(ws);
+}
+
+// --- ADR-0012 Verity-performed stage lifecycle git (stage 17) --------------------
+// Declaring these three is how a provider says "my runtime cannot let the model
+// write under `.git`, so Verity performs the stage lifecycle git for it". The
+// reference driver declares none of them — its harness performs its own git
+// (ADR-0012 records the asymmetry deliberately) — so its coordinator path, its
+// rendered prompts, and its result object are all unchanged.
+//
+// The probes behind this (docs/dev/codex-headless-canary-results-0.146.0.md):
+// under `workspace-write`, `git status` is rc=0 but `git checkout -b` and
+// `git commit` are rc=128 "Read-only file system". We do NOT widen that — see
+// agents/git-lifecycle.cjs on why granting `.git` writes is a REJECTED option.
+
+// Does this run need Verity-performed git, and on which branch? null = no
+// (nothing about the run changes).
+function planGit(policyBag, ctx) {
+  return gitLifecycle.plan({ ...ctx, policy: policyBag.policy });
+}
+
+// Fail-closed provision check — git READS only, so a refusal mutates nothing.
+function assertGitProvidable(plan, cwd) {
+  return gitLifecycle.assertProvidable(cwd, plan);
+}
+
+// Create/check out the stage branch, in Verity's process, BEFORE dispatch.
+function beginGit(plan, cwd) {
+  return gitLifecycle.begin(cwd, plan);
+}
+
+// Commit the role's file changes on that branch, push, and open the PR.
+function finishGit(started, cwd, opts) {
+  return gitLifecycle.finish(cwd, started, opts);
+}
+
+// The report shape for a run that never reached the commit (failed, gated, or
+// containment-rejected): the branch still exists and the reason is named.
+function skipGit(started, reason) {
+  return gitLifecycle.skipped(started, reason);
+}
+
+// Put the checkout back where the run found it. Never throws — a failed restore
+// is data the coordinator reports, not a second failure.
+function restoreGit(started, cwd) {
+  return gitLifecycle.restore(cwd, started);
+}
+
+// Item-kind discriminator (stage 10, CDX-004): real Codex JSONL carries an
+// item's kind at `item.type` (e.g. {"type":"item.completed","item":{"id":
+// "item_0","type":"agent_message","text":…}}); the pre-stage-10 stub shape
+// used `item.item_type`, retained here as an explicitly-tested legacy
+// fallback. This helper reads the NESTED item object ONLY — the event-level
+// `type` field ("item.completed" etc.) is a different axis and must never be
+// consulted for the item kind.
+function itemKind(item) {
+  if (typeof item.type === 'string') {
+    return item.type;
+  }
+  if (typeof item.item_type === 'string') {
+    return item.item_type;
+  }
+  return null;
 }
 
 // Tolerant line-by-line JSONL digest (§9.6). Recognizes the lifecycle events
@@ -367,7 +694,7 @@ function parseTranscript(transcriptPath) {
       continue; // tolerate unknown shapes — never crash on a future event
     }
     if (obj.type === 'item.completed' && isPlainObject(obj.item)) {
-      if (obj.item.item_type === 'agent_message' && typeof obj.item.text === 'string') {
+      if (itemKind(obj.item) === 'agent_message' && typeof obj.item.text === 'string') {
         digest.lastAgentMessage = obj.item.text;
       }
     } else if (obj.type === 'turn.completed') {
@@ -413,21 +740,31 @@ function countToolCalls(transcriptPath) {
     if (!isPlainObject(obj) || obj.type !== 'item.started' || !isPlainObject(obj.item)) {
       continue;
     }
-    if (TOOL_ITEM_TYPES.includes(obj.item.item_type)) {
+    if (TOOL_ITEM_TYPES.includes(itemKind(obj.item))) {
       count += 1;
     }
   }
   return count;
 }
 
-// Fold Codex usage into the frozen v1 totals. Codex reports
-// {input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens,
-// total_tokens} where cached/reasoning are SUBSETS of input/output (OpenAI
-// usage semantics) — so folding is the identity on the two headline fields,
-// and the raw detail travels in the additive usage_detail block.
+// Fold Codex usage into the frozen v1 totals. cached/reasoning counts are
+// SUBSETS of input/output (OpenAI usage semantics) — so folding is the identity
+// on the two headline fields, and the raw detail travels in the additive
+// usage_detail block.
 // est_usd is ALWAYS null: Codex reports no exact per-run dollar cost, and
 // null means UNKNOWN — writing 0 would tell the budget breaker the run was
 // free (ADR-0008 contract violation).
+//
+// The allowlist is what a REAL turn.completed event carries (spike F7, issue
+// #29):
+//   {"input_tokens":47180,"cached_input_tokens":43264,"cache_write_input_tokens":0,
+//    "output_tokens":165,"reasoning_output_tokens":0}
+// — note `cache_write_input_tokens`, which the pre-stage-12 allowlist dropped
+// on the floor, and NO `total_tokens` at all. `total_tokens` stays listed
+// because the allowlist copies only what is present: a documented/older shape
+// that carries it still travels, and a real event that omits it simply has no
+// such key. Nothing here touches tokens.in/out, so the headline numbers (and
+// every budget decision built on them) are unchanged either way.
 function normalizeUsage(final) {
   const usage = isPlainObject(final.usage) ? final.usage : null;
   if (usage === null) {
@@ -437,6 +774,7 @@ function normalizeUsage(final) {
   for (const key of [
     'input_tokens',
     'cached_input_tokens',
+    'cache_write_input_tokens',
     'output_tokens',
     'reasoning_output_tokens',
     'total_tokens',
@@ -520,7 +858,7 @@ function normalizeResult(final, _opts = {}) {
           final.failure !== null
         ) {
           throw new AgentExecError(
-            `inconsistent result: role reported '${structured.outcome}' but the transcript recorded a failure (${firstLine(final.failure)})`,
+            `inconsistent result: role reported '${structured.outcome}' but the transcript recorded a failure (${failureText(final.failure)})`,
             'invalid-result',
           );
         }
@@ -548,7 +886,7 @@ function normalizeResult(final, _opts = {}) {
     }
   }
   if (final.failure !== null) {
-    return { outcome: 'failed', artifacts: {}, error: firstLine(final.failure) };
+    return { outcome: 'failed', artifacts: {}, error: failureText(final.failure) };
   }
   throw new AgentExecError(
     `agent completed with no valid role result (no structured final message, no outcome marker; transcript: ${final.transcriptPath}) — refusing to guess`,
@@ -561,27 +899,50 @@ module.exports = {
   displayName: 'OpenAI Codex CLI',
   binaryEnvVar: 'VERITY_CODEX_BIN',
   defaultBinary: DEFAULT_BINARY,
+  BASELINE_ENV_PASSLIST,
   CAPABILITY_COMMAND_DENIALS,
+  CAPABILITY_CREDENTIALS,
+  // The required-feature matrix, re-exported so the pin's evidence is reachable
+  // from the driver surface itself (docs/dev/codex-feature-matrix.md renders it).
+  CODEX_FEATURES: features.CODEX_FEATURES,
   CREDENTIAL_READ_DENIALS,
   MERGE_AUTHORITY_DENIALS,
   MIN_CODEX_VERSION,
   PROTECTED_WRITE_PATHS,
   TOOL_ITEM_TYPES,
   supportsMaxTurns: false,
+  // Stage 24 (ADR-0013): this driver's runtime cannot reach GitHub, so it
+  // consumes a Verity-gathered state snapshot in its rendered prompt. The
+  // reference driver does not declare this — its harness performs its own
+  // GitHub reads, and agent-exec REJECTS the flag for it (never a silently
+  // ignored knob).
+  supportsStateSnapshot: true,
   annotate,
   applyOverrides,
+  assertGitProvidable,
+  beginGit,
   buildArgv,
+  captureInvariants,
+  checkEnforceable,
+  checkInvariants,
   checkVersion,
-  commandRules,
+  childEnv,
   countToolCalls,
+  disposeWorkspace,
   execute,
   finalMessageFilename,
+  finishGit,
+  mergeWorkspace,
+  planGit,
+  restoreGit,
+  skipGit,
+  itemKind,
   normalizeResult,
   normalizeUsage,
   parseTranscript,
+  prepareWorkspace,
   readPolicy,
   renderPrompt,
   resolveBinary,
-  rulesFilename,
   transcriptFilename,
 };

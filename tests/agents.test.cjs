@@ -268,6 +268,25 @@ test('characterize: empty allowlist array → 30 bad-allowlist, "non-empty" rule
   assert(!fs.existsSync(fx.argvFile), 'agent never invoked');
 });
 
+// Slug PRECEDENCE, deliberately chosen in stage 16 (issue #42): the driver's
+// permission surface is filesystem-only and is evaluated BEFORE the binary
+// preflight, which shells out. So when both are broken the answer is the
+// deny-by-default one — the role's allowlist is missing whether or not this
+// machine happens to have a working `claude`. Nothing else about either
+// diagnosis changed; each still stands alone exactly as before.
+test('characterize: the T06 allowlist refusal PRECEDES the binary preflight (issue #42)', () => {
+  const fx = fixture();
+  canned(fx, MARKER_SUCCESS);
+  const roleDir = echoRole(fx);
+  fs.unlinkSync(path.join(roleDir, 'echo.tools.json'));
+  const { stderr, code } = run(fx, ['echo', 'hi', '--run-id', 'c-8b'], {
+    VERITY_AGENT_BIN: path.join(fx.dir, 'no-such-claude'),
+  });
+  assertEqual(code, 30);
+  assert(stderr.includes('verity-agent-exec: 30 missing-allowlist:'), 'deny-by-default answers');
+  assert(!stderr.includes('agent-missing'), 'the binary probe does not mask the policy refusal');
+});
+
 // --- marker extraction / marker-absent classification ---
 
 test('characterize: marker on the last line WINS over the CLI result subtype', () => {
@@ -508,6 +527,7 @@ test('seam: agent-exec module.exports surface is intact (worker/test compatibili
     'extractMarker',
     'parseVersion',
     'readAllowlist',
+    'readParkedResult', // stage 31 (ADR-0014): re-read a parked result for the worker's resume
     'renderPrompt',
     'resolveRole',
   ];

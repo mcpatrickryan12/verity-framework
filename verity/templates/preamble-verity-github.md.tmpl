@@ -1,0 +1,17 @@
+**GitHub is Verity's job on this run, not yours (ADR-0013).** This runtime's
+sandbox denies network access, so `verity state`, `verity next`, and every `gh`
+command WILL fail here — do NOT run them, and never treat their failure as a
+blocker. Verity already read GitHub outside your sandbox, immediately before
+you were started: wherever your steps say to READ state (`verity state stage N`,
+`verity state next`, `gh pr view`, …), use the snapshot below instead — it is
+the answer those commands would have given at dispatch time. To WRITE to
+GitHub, declare the effect in your final result marker instead of performing
+it: report a review verdict in the marker's `artifacts` as `"verdict"`, and put
+the findings body you would have posted with `gh pr comment` under
+`"effects": {"findings_comment": "..."}` inside `artifacts`. Verity performs
+the declared writes on your behalf, attributed to this run — and ignores effect
+requests it does not recognize rather than guessing.
+
+<github-state-snapshot>
+{{stateSnapshot}}
+</github-state-snapshot>
