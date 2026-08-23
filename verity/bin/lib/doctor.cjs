@@ -350,13 +350,216 @@ function codexEnvironmentChecks(opts = {}) {
 // by the runtime (stage 9): claude keeps the stage-1 registry byte-identical;
 // codex checks the selected runtime ONLY (no claude row — a Codex-only
 // machine can be green) plus its environment rows.
+// Stage 85 (ADR-0029; operator-smoke finding): on the LOCAL substrate `gh` is
+// NOT a dependency — the whole point of the substrate — so probing it is wrong
+// three ways: a host without gh must not fail local health, `gh --version` was
+// residual gh spawn noise in the real-model zero-gh smoke, and the row's
+// `gh auth status` probe CALLS GitHub. The row does not silently vanish: it is
+// REPLACED by an explicitly-skipped row in the contract's own vocabulary
+// (unobserved values are null — present/version were not probed; ok:true means
+// "this check cannot fail local health"; the detail says exactly why). Every
+// other substrate is byte-identical (the row probes exactly as before).
+function localSubstrateSkipRow(dep) {
+  return {
+    name: dep.name,
+    present: null,
+    version: null,
+    ok: true,
+    detail:
+      'skipped on the local substrate: gh is not a dependency of substrate: local (ADR-0029, stage 85) — not probed (its auth probe would call GitHub), and its absence never fails local health',
+  };
+}
+
+function checkOrSkip(dep, opts) {
+  if (opts.substrate === 'local' && dep.name === 'gh') {
+    return localSubstrateSkipRow(dep);
+  }
+  return checkDependency(dep, opts);
+}
+
+// Stage 87 (ADR-0030): the localhost gate runner's host-dependency rows —
+// probed ONLY when the project's RESOLVED gate_runner is 'localhost'
+// (runChecks below); stage 88 adds the `remote:<name>` rows on the same
+// machinery (remoteGateRunnerChecks below); every other resolved runner adds
+// nothing, so an unconfigured project's report is byte-identical and needs no
+// new dependencies (ADR-0030 Consequences: new host dependencies only when
+// configured). Two localhost rows, both on the existing registry-row
+// machinery:
+//   docker  present via `--version` (daemonless), daemon reachable via the
+//           row's authCheck slot (`docker info` — exit-code judged, so a
+//           stopped daemon reads "present but `docker info` failed")
+//   act     present + a parseable version (no configured minimum — the
+//           gates-act.cjs preflight enforces the same two shapes at run time)
+// Binaries honor VERITY_DOCKER_BIN / VERITY_ACT_BIN (the VERITY_CODEX_BIN
+// override convention) so doctor probes exactly the executables the runner
+// would spawn.
+function gateRunnerChecks(opts = {}) {
+  const env = opts.env || process.env;
+  // Stage 88 (ADR-0030): remote:<name> gets its own four rows — catalog
+  // resolution + over-SSH probes — and 'localhost' stays byte-identical.
+  if (typeof opts.gateRunner === 'string' && opts.gateRunner.startsWith('remote:')) {
+    return remoteGateRunnerChecks(opts);
+  }
+  return [
+    checkDependency(
+      {
+        name: 'docker',
+        binary: env.VERITY_DOCKER_BIN || 'docker',
+        versionArgs: ['--version'],
+        authCheck: ['info'],
+      },
+      opts,
+    ),
+    checkDependency(
+      { name: 'act', binary: env.VERITY_ACT_BIN || 'act', versionArgs: ['--version'] },
+      opts,
+    ),
+  ];
+}
+
+// Stage 88 (ADR-0030): the `remote:<name>` gate runner's preflight rows. Four
+// rows, in dependency order, each gated on the one before it — a probe that
+// cannot honestly run (no resolved target, no SSH reachability) reads
+// "not probed" (present: null — the unobserved-value vocabulary from the
+// stage-85 skip row) with ok: false, so doctor still fails loudly without
+// hammering a dead SSH channel three times:
+//   gate-runner-catalog  the name resolves against ~/.verity/gate-runners.md
+//                        (gate-runners.resolveRemote — a failure's detail IS
+//                        the resolver's fail-closed message: catalog path +
+//                        known entry names)
+//   ssh                  reachability: `ssh -o BatchMode=yes <target> true` —
+//                        BatchMode forbids interactive prompts (doctor must
+//                        never hang on a password), exit-code judged only
+//   remote-docker        `ssh … <target> docker info` — exit-code judged; a
+//                        remote stopped daemon or absent docker both fail
+//   remote-act           `ssh … <target> act --version` — exit 0 AND a
+//                        parseable x.y.z (the stage-87 act shape, remotely)
+// All probes run over the operator's EXISTING SSH context (their config,
+// agent, keys) — Verity never reads, passes, or logs credential contents; the
+// only catalog material echoed is the entry name, the target (host/user the
+// operator wrote), and the catalog path. The ssh binary honors VERITY_SSH_BIN
+// (the VERITY_DOCKER_BIN/VERITY_ACT_BIN override convention) so tests stub it
+// and off-PATH installs work. Row names are distinct from the localhost rows
+// ('remote-docker'/'remote-act', not 'docker'/'act'): these rows assert the
+// REMOTE host's provisioning, and the local machine needs neither binary.
+function remoteGateRunnerChecks(opts = {}) {
+  const env = opts.env || process.env;
+  const exec = opts.exec || spawnSync;
+  const ssh = env.VERITY_SSH_BIN || 'ssh';
+  const name = opts.gateRunner.slice('remote:'.length);
+  const rows = [];
+
+  let resolved = null;
+  let catalogDetail;
+  try {
+    // Lazy require (the doctor-stays-a-leaf convention): gate-runners pulls in
+    // autonomy/deployment, which the agent drivers requiring doctor never need.
+    resolved = require('./gate-runners.cjs').resolveRemote(name, opts);
+    catalogDetail = `entry '${name}' resolves to ${resolved.target} (${resolved.path})`;
+  } catch (err) {
+    catalogDetail = err.message;
+  }
+  rows.push({
+    name: 'gate-runner-catalog',
+    present: resolved !== null,
+    version: null,
+    ok: resolved !== null,
+    detail: catalogDetail,
+  });
+
+  const skipped = (rowName, why) => ({
+    name: rowName,
+    present: null,
+    version: null,
+    ok: false,
+    detail: `not probed: ${why}`,
+  });
+  if (resolved === null) {
+    rows.push(
+      skipped('ssh', 'the catalog entry did not resolve (see gate-runner-catalog)'),
+      skipped('remote-docker', 'the catalog entry did not resolve (see gate-runner-catalog)'),
+      skipped('remote-act', 'the catalog entry did not resolve (see gate-runner-catalog)'),
+    );
+    return rows;
+  }
+
+  // One probe shape for all three remote rows: exit-code judged, never parsed
+  // for judgment (ADR-0028); spawn errors name the LOCAL ssh binary problem.
+  const probe = (remoteArgv) =>
+    exec(ssh, ['-o', 'BatchMode=yes', resolved.target, ...remoteArgv], { encoding: 'utf8' });
+  const failWhy = (res) =>
+    res.error
+      ? res.error.code || res.error.message
+      : firstLine(res.stderr) || firstLine(res.stdout) || `exit ${res.status}`;
+  const label = (cmd) => `\`${ssh} -o BatchMode=yes ${resolved.target} ${cmd}\``;
+
+  const reach = probe(['true']);
+  const reachable = !reach.error && reach.status === 0;
+  rows.push({
+    name: 'ssh',
+    present: !reach.error, // the LOCAL ssh binary ran (reachability is `ok`)
+    version: null,
+    ok: reachable,
+    detail: reachable
+      ? `${label('true')} ok`
+      : `${label('true')} failed: ${failWhy(reach)} — no interactive prompts (BatchMode); fix SSH access to '${name}' or point VERITY_SSH_BIN at your ssh`,
+  });
+  if (!reachable) {
+    rows.push(
+      skipped('remote-docker', `SSH to ${resolved.target} is not reachable (see ssh)`),
+      skipped('remote-act', `SSH to ${resolved.target} is not reachable (see ssh)`),
+    );
+    return rows;
+  }
+
+  const docker = probe(['docker', 'info']);
+  const dockerOk = !docker.error && docker.status === 0;
+  rows.push({
+    name: 'remote-docker',
+    present: dockerOk,
+    version: null,
+    ok: dockerOk,
+    detail: dockerOk
+      ? `remote \`docker info\` ok on ${resolved.target}`
+      : `remote \`docker info\` failed on ${resolved.target}: ${failWhy(docker)} — is Docker installed there and the daemon running?`,
+  });
+
+  const act = probe(['act', '--version']);
+  const actRan = !act.error && act.status === 0;
+  const actVersion = actRan ? (parseVersion(act.stdout)?.join('.') ?? null) : null;
+  rows.push({
+    name: 'remote-act',
+    present: actRan,
+    version: actVersion,
+    ok: actRan && actVersion !== null,
+    detail:
+      actRan && actVersion !== null
+        ? `remote act ${actVersion} on ${resolved.target}`
+        : actRan
+          ? `could not parse a version from remote \`act --version\` on ${resolved.target}: ${firstLine(act.stdout) || '(empty)'}`
+          : `remote \`act --version\` failed on ${resolved.target}: ${failWhy(act)} — is nektos/act installed there?`,
+  });
+  return rows;
+}
+
 function runChecks(opts = {}) {
+  // Stage 87 (ADR-0030): the resolved gate_runner travels beside the resolved
+  // substrate — 'localhost' appends its Docker+act probe rows and (stage 88)
+  // 'remote:<name>' its catalog+SSH probe rows to whichever registry the
+  // runtime selected; anything else appends nothing (unconfigured projects
+  // stay byte-identical).
+  const remote = typeof opts.gateRunner === 'string' && opts.gateRunner.startsWith('remote:');
+  const gateRows = opts.gateRunner === 'localhost' || remote ? gateRunnerChecks(opts) : [];
   if (opts.agent === 'codex') {
     const deps = opts.deps || CODEX_DEPENDENCIES;
-    return [...deps.map((dep) => checkDependency(dep, opts)), ...codexEnvironmentChecks(opts)];
+    return [
+      ...deps.map((dep) => checkOrSkip(dep, opts)),
+      ...codexEnvironmentChecks(opts),
+      ...gateRows,
+    ];
   }
   const deps = opts.deps || DEPENDENCIES;
-  return deps.map((dep) => checkDependency(dep, opts));
+  return [...deps.map((dep) => checkOrSkip(dep, opts)), ...gateRows];
 }
 
 // 0 = every check ok, 1 = at least one failing check (the `--quiet` contract).
@@ -440,7 +643,28 @@ function dispatch(args, flags = {}) {
   process.stderr.write(
     `verity doctor: checking agent runtime '${selection.agent}' (selected by ${selection.source})\n`,
   );
-  return runChecks({ agent: selection.agent });
+  // Stage 85 (ADR-0029): the cwd's resolved delivery substrate travels into
+  // the check pass so a `substrate: local` repo's gh row reads
+  // skipped-for-substrate (see runChecks) — a role or operator running
+  // `verity doctor` inside a local repo must not probe gh (nor call GitHub via
+  // `gh auth status`). Lazy require: substrate-local requires autonomy, which
+  // this module never requires at load time, but the lazy form keeps doctor a
+  // leaf for the agent drivers exactly as before. github/unreadable-policy
+  // resolves 'github' — byte-identical probes.
+  const substrate = require('./substrate-local.cjs').resolveSubstrate(flags.cwd || process.cwd());
+  // Stage 87 (ADR-0030): the resolved gate_runner is obtained the same way the
+  // substrate is — from the cwd's loaded policy, lazily and degrade-informative:
+  // 'localhost' adds the Docker+act probe rows (see gateRunnerChecks); any
+  // other resolved value — including the absent-key native resolution and a
+  // policy doctor cannot read (`verity autonomy validate` owns that error) —
+  // adds nothing, keeping unconfigured projects byte-identical.
+  let gateRunner;
+  try {
+    gateRunner = require('./autonomy.cjs').loadPolicy(flags.cwd || process.cwd()).gate_runner;
+  } catch {
+    gateRunner = undefined; // unreadable policy never breaks doctor
+  }
+  return runChecks({ agent: selection.agent, substrate, gateRunner });
 }
 
 module.exports = {
@@ -454,6 +678,7 @@ module.exports = {
   dispatch,
   exitCodeFor,
   firstLine,
+  gateRunnerChecks,
   parseVersion,
   resolveAgent,
   runChecks,

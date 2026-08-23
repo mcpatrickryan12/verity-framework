@@ -458,9 +458,89 @@ test('renderPrompt: packaged role gets codex host-pass transforms + role args', 
   assert(!prompt.includes('$ARGUMENTS'), 'role args resolved');
   assert(!prompt.includes('<invocation arguments>'), 'codex placeholder resolved');
   assert(!prompt.includes('/verity:'), 'cross-role handoffs rewritten by the codex pass');
-  assert(prompt.includes('$verity-'), 'handoffs use explicit codex skill invocation');
+  // issue #170: the codex pass rewrites `/verity:<role>` → `$verity-<role>` (correct
+  // for the interactive SKILL.md), but the HEADLESS render must NOT carry a live
+  // `$verity-` explicit-invocation token — the model auto-invokes it. renderPrompt
+  // neutralizes it to inert prose; the sibling reference survives only as text.
+  assert(!prompt.includes(`$${'verity-'}`), 'no live skill-invocation token in headless render');
+  assert(prompt.includes('the verity:review role'), 'handoff survives as inert prose');
   assert(prompt.includes('<headless-result-contract>'), 'result contract appended');
 });
+
+// issue #170: every role prompt carries `/verity:<sibling>` handoffs, so every
+// headless codex render would otherwise carry a live `$verity-<sibling>` token
+// the model auto-invokes instead of executing THIS role. Assert the neutralization
+// on the real plan role, whose handoff is `/verity:build`.
+test('renderPrompt: headless codex render carries no live skill-invocation token (#170)', () => {
+  const prompt = codex.renderPrompt(path.join(ROLES_DIR, 'plan.md'), ['9']);
+  assert(
+    !prompt.includes(`$${'verity-'}`),
+    'no $verity- invocation token survives the headless render',
+  );
+  assert(
+    prompt.includes('the verity:build role'),
+    'the /verity:build handoff survives as inert prose',
+  );
+});
+
+// Stage 66 (ADR-0026, #176/#185): a contained codex plan cannot run the denied
+// `gh issue create`. Step 7 must frame work-item registration as NON-FATAL and
+// worker-owned so the plan reaches SUCCESS (which commits the stage files and
+// lets the worker reconcile the issues) rather than self-reporting `failed`.
+test('renderPrompt: plan step 7 frames work-item registration as non-fatal / worker-owned (#176/#185)', () => {
+  const prompt = codex.renderPrompt(path.join(ROLES_DIR, 'plan.md'), ['9']);
+  assert(prompt.includes('NON-FATAL'), 'step 7 marks work-item registration NON-FATAL');
+  assert(prompt.includes('WORKER-OWNED'), 'step 7 assigns work-item registration to the worker');
+  assert(
+    prompt.includes('Report the plan as SUCCESS'),
+    'step 7 tells the agent to report SUCCESS once artifacts exist on disk',
+  );
+  assert(
+    /idempotently\s+[\s\S]*reconciles/.test(prompt) || prompt.includes('reconcile is idempotent'),
+    'step 7 points at the idempotent worker reconcile as the backstop',
+  );
+  assert(!prompt.includes('Keep running this step'), 'the old must-run-or-fail framing is gone');
+});
+
+// Stage 71 (ADR-0025, #202): the plan role's Mode A guidance must bound the FIRST
+// plan to a thin first buildable slice (~3–5 stages), not decompose the whole
+// architecture in one run — even when the spec implies "8–12 stages" — and must
+// cite re-planning the next slice (Mode B). Weak/buried guidance let a heavy
+// fixture thrash the run budget into an expensive from-scratch retry. The fix is
+// prompt-only and renders from the same plan.md into BOTH providers, so assert it
+// on the codex skill render AND the claude command render.
+for (const [label, render] of [
+  ['codex', () => codex.renderPrompt(path.join(ROLES_DIR, 'plan.md'), ['9'])],
+  ['claude', () => claude.renderPrompt(path.join(ROLES_DIR, 'plan.md'), ['9'])],
+]) {
+  test(`renderPrompt: ${label} plan Mode A bounds the first plan to a thin buildable slice (#202)`, () => {
+    const prompt = render();
+    // (a) frames the first plan as a bounded first buildable slice, not the whole architecture
+    assert(
+      prompt.includes('first buildable slice'),
+      'Mode A frames the first plan as a bounded first buildable slice',
+    );
+    assert(
+      /not the\s+whole architecture|Do not decompose the entire architecture/i.test(prompt),
+      'Mode A tells the plan NOT to decompose the whole architecture in one run',
+    );
+    // (b) quantifies "thin" with a small number
+    assert(prompt.includes('3–5'), 'Mode A quantifies the first slice (3–5 stages)');
+    // …and holds the line even when the architecture implies many stages
+    assert(
+      prompt.includes('8–12'),
+      'Mode A holds the thin line even when the spec implies an 8–12 stage build',
+    );
+    // (c) references re-planning the next slice via the recurring intake (Mode B)
+    assert(prompt.includes('Mode B'), 'Mode A cites re-planning the next slice via Mode B');
+    assert(
+      /re-plan/i.test(prompt),
+      'Mode A explains you re-plan the next slice after the current one merges',
+    );
+    // it is the framework's decided model, not an ad-hoc shortcut
+    assert(prompt.includes('ADR-0025'), 'Mode A grounds the thin-backlog model in ADR-0025');
+  });
+}
 
 // Stage 11 (ADR-0011) replaced the stage-8 assertion here ("the child env is
 // exactly the caller env — nothing injected"), which described the LEAK: the

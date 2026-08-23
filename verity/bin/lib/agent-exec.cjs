@@ -89,13 +89,23 @@ const {
   exitCodeFor,
   extractMarker,
 } = require('./agents/result-contract.cjs');
+// Stage 63 (ADR-0026, #176): worker-owned, idempotent `[stage N]` work-item
+// reconciliation, run post-plan behind a default-OFF flag (see below).
+const workItems = require('./work-items.cjs');
 
 const DEFAULT_AGENT = 'claude';
-const DEFAULT_MAX_TURNS = 40;
+// Stage 74 (#202 headroom): 40 was too low for a heavy role — a walking-skeleton
+// BUILD on a large seeded fixture (bootable app + tests) exhausted 40 turns and
+// failed, forcing an expensive retry. 80 gives heavy plan/build roles room to
+// complete in one dispatch. Still fail-safe: a genuinely runaway agent is bounded
+// by max_tokens_per_run (worker limits) and the per-run --timeout-secs deadline,
+// so this only raises the turn ceiling for legitimate heavy work. Claude-only
+// (codex has no max-turns concept, ADR-0008).
+const DEFAULT_MAX_TURNS = 80;
 // run-id and role become path components under ~/.verity/logs — keep them tame.
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const USAGE =
-  'usage: verity agent-exec <role> [args...] --run-id <id> [--max-turns N] [--timeout-secs N] [--agent claude|codex] [--model M] [--sandbox S] [--approval A] [--acknowledge-gaps c1,c2] [--containment-tier 1|2] [--keep-workspace] [--state-snapshot JSON]';
+  'usage: verity agent-exec <role> [args...] --run-id <id> [--max-turns N] [--timeout-secs N] [--agent claude|codex] [--model M] [--sandbox S] [--approval A] [--acknowledge-gaps c1,c2] [--containment-tier 1|2] [--keep-workspace] [--state-snapshot JSON] [--substrate github|local]';
 // ADR-0011 enforcement tiers. Tier 1 (stage 11: credential stripping +
 // mandatory post-run invariants) is what every codex run has had since that
 // stage and stays the DEFAULT. Tier 2 (stage 14: disposable shaped workspace +
@@ -194,6 +204,36 @@ function runDispatch(args, flags, session) {
     throw new AgentExecError(USAGE);
   }
   const roleArgs = args.slice(1);
+  // Stage 63 (ADR-0026, #176): the worker-owned work-item reconcile is a boolean
+  // dark-launch flag (a value is ignored, like --keep-workspace). Default-OFF ⇒
+  // withWorkItems is inert and every result is byte-identical to pre-stage-63.
+  const reconcileWorkItemsFlag = flags['reconcile-work-items'] !== undefined;
+  // Stage 65 (#182/#176): reconcile whenever the plan agent RAN and its stage
+  // files merged back — i.e. `success` OR `failed`, not success-only. The codex
+  // plan role self-reports `failed` because its `gh issue create` is denied
+  // under containment (the exact case this reconcile exists to handle), yet its
+  // stage files still merge back to cwd (mergeWorkspace runs after execute). A
+  // success-only gate skipped the reconcile there, so no `[stage N]` work-items
+  // got created. `gated`/`infra_error` stay excluded — the model may not have
+  // produced/merged artifacts, so there is nothing to trust.
+  const RECONCILE_PLAN_OUTCOMES = new Set(['success', 'failed']);
+  const withWorkItems = (out) => {
+    if (!reconcileWorkItemsFlag || role !== 'plan' || !RECONCILE_PLAN_OUTCOMES.has(out.outcome)) {
+      return out;
+    }
+    const wi = workItems.reconcileWorkItems(cwd, { flag: true });
+    // Stage 67 (#188): the reconcile stays best-effort (never fatal), but a
+    // non-empty failed[] must no longer be SILENT — a `gh issue create` that
+    // fails (e.g. on a missing label) left zero `[stage N]` items with no trace.
+    // Surface each failure in the §8.2 stderr style; the result is unchanged.
+    if (Array.isArray(wi.failed) && wi.failed.length > 0) {
+      const detail = wi.failed
+        .map((f) => `[stage ${f.number ?? f.file ?? '?'}] ${f.error}`)
+        .join('; ');
+      stderr(`verity-agent-exec: work-item-reconcile-failed: ${detail}`);
+    }
+    return { ...out, work_items: wi };
+  };
   const runId = flags['run-id'];
   if (typeof runId !== 'string' || !SAFE_ID.test(runId)) {
     throw new AgentExecError(`--run-id is required (letters/digits/._- only). ${USAGE}`);
@@ -291,6 +331,20 @@ function runDispatch(args, flags, session) {
       );
     }
   }
+  // Stage 81 (ADR-0029): the run's delivery substrate, omitted-in like every
+  // other knob — the worker passes it ONLY when the resolved policy.substrate
+  // is 'local', so every github/absent dispatch is byte-identical (no flag).
+  // 'github' is accepted as the explicit spelling of the default. Anything
+  // else is a usage error — never a silent fallback to the github projection,
+  // which would hand a local run the gh/network grants this flag exists to
+  // withhold.
+  const rawSubstrate = flags.substrate;
+  const substrate = rawSubstrate === undefined ? 'github' : String(rawSubstrate);
+  if (rawSubstrate !== undefined && substrate !== 'github' && substrate !== 'local') {
+    throw new AgentExecError(
+      `--substrate must be 'github' or 'local' (ADR-0029), got ${JSON.stringify(rawSubstrate)}. ${USAGE}`,
+    );
+  }
 
   // -- infra preconditions (emit infra_error result, exit 30) --
   const agent = flags.agent === undefined ? DEFAULT_AGENT : String(flags.agent);
@@ -334,6 +388,19 @@ function runDispatch(args, flags, session) {
   if (stateSnapshot !== null && provider.supportsStateSnapshot !== true) {
     throw new AgentExecError(
       `--state-snapshot renders Verity-read GitHub facts into a contained role's prompt, which '${agent}' does not consume — its harness performs its own GitHub reads (ADR-0013). ${USAGE}`,
+    );
+  }
+  // Same rule for the local substrate (stage 81, ADR-0029): the narrowing
+  // ("roles get NO gh and NO network on local") lives in each provider's
+  // narrowForSubstrate hook — codex narrows its capability projection (stage
+  // 81), claude narrows its .tools.json allowlist (stage 82: gh/WebFetch/
+  // WebSearch grants stripped, harness-enforced). A provider WITHOUT the hook
+  // still REJECTS the flag rather than dispatching with gh/network tools the
+  // substrate forbids (fail closed). Explicit '--substrate github' is the
+  // default spelled out and is accepted anywhere.
+  if (substrate === 'local' && typeof provider.narrowForSubstrate !== 'function') {
+    throw new AgentExecError(
+      `--substrate local narrows the role's permission surface (no gh, no network on the local substrate, ADR-0029), which '${agent}' does not implement — refusing rather than dispatching with tools the substrate forbids. ${USAGE}`,
     );
   }
   // Same rule for the tier-2 request: a provider that does not implement the
@@ -382,6 +449,24 @@ function runDispatch(args, flags, session) {
       });
     } catch (err) {
       return infra(err.slug || 'bad-override', err.message);
+    }
+  }
+  // Stage 81 (ADR-0029): substrate narrowing — a 'local' run's projection
+  // drops github_read/github_write/network on codex, and (stage 82) the
+  // gh/WebFetch/WebSearch allowlist grants on claude (narrowing only; any
+  // other substrate returns the policy object untouched, so the github path
+  // is byte-identical). Applied BEFORE the honesty gate below on purpose: the
+  // narrowed policy is what checkEnforceable judges, so a role whose own file
+  // granted `network` follows the ordinary acknowledged_enforcement_gaps flow
+  // on local instead of a restriction that silently appears enforced. A
+  // narrowing the provider cannot perform honestly (claude: an allowlist that
+  // narrows to NOTHING) refuses the run — fail closed, never a tool-less or
+  // over-granted dispatch.
+  if (substrate === 'local') {
+    try {
+      policy = provider.narrowForSubstrate(policy, substrate);
+    } catch (err) {
+      return infra(err.slug || 'unenforceable-policy', err.message);
     }
   }
 
@@ -682,16 +767,34 @@ function runDispatch(args, flags, session) {
   const { tokens, est_usd: estUsd, ...usageExtra } = usage;
   const toolCalls = provider.countToolCalls(transcript);
   const { outcome, error, artifacts } = normalized;
-  return enforced(
-    result(outcome, {
-      tokens,
-      est_usd: estUsd,
-      tool_calls: toolCalls,
-      artifacts,
-      error,
-      ...notes,
-      ...usageExtra,
-    }),
+  // Stage 63 (ADR-0026, #176), widened in stage 65 (#182): after a plan role
+  // that RAN (success OR failed — see RECONCILE_PLAN_OUTCOMES above), the WORKER
+  // (this process — it holds ambient gh; containment strips gh only from the
+  // child sandbox) reconciles the merged-back stage-instructions/ files into
+  // `[stage N]` GitHub work-items, idempotently. This runs for BOTH paths —
+  // Claude (tier-1, the agent wrote to cwd directly) and Codex (tier-2, the
+  // shaped-workspace merge-back has already copied the files back into cwd by
+  // here) — closing the Codex plan stall (#176) provider-agnostically.
+  //
+  // Default-OFF via `--reconcile-work-items` (the worker passes it when the
+  // operator's `agent.reconcile_work_items` policy is on). Absent the flag,
+  // withWorkItems returns the result object UNCHANGED — byte-identical to
+  // pre-stage-63, and the plan agent's own `gh issue create` remains the sole
+  // flag-OFF creator (unchanged for Claude). Keyed on role === 'plan' and a
+  // success/failed outcome (enforced() may have downgraded the outcome), so no
+  // other run path is touched.
+  return withWorkItems(
+    enforced(
+      result(outcome, {
+        tokens,
+        est_usd: estUsd,
+        tool_calls: toolCalls,
+        artifacts,
+        error,
+        ...notes,
+        ...usageExtra,
+      }),
+    ),
   );
 }
 

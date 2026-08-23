@@ -150,6 +150,21 @@ if (step.addIssues || step.addPrs) {
   s.prs = s.prs.concat(step.addPrs || []);
   fs.writeFileSync(process.env.GH_STATE_FILE, JSON.stringify(s));
 }
+// Stage 73: the plan role WRITES stage files (a request goes from N stages to
+// N+k) — the real mechanism a plan turns a request INTO stages. Written to the
+// workspace root (dirname of the queue file), the dir the worker reads via
+// readStages. Lets a fixture model plan → stages-created-in-run → build.
+if (step.createStages) {
+  const path = require('node:path');
+  const dir = path.join(path.dirname(queueFile), 'stage-instructions');
+  fs.mkdirSync(dir, { recursive: true });
+  step.createStages.forEach((s, i) => {
+    const num = s.number || i + 1;
+    const slug = s.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    fs.writeFileSync(path.join(dir, 'stage-' + num + '-' + slug + '.md'),
+      '# Stage ' + num + ': ' + s.title + '\\n\\n- **Type:** ' + (s.type || 'feature') + '\\n- **Depends on:** none\\n');
+  });
+}
 if (step.raw !== undefined) { process.stdout.write(step.raw); process.exit(0); }
 const result = Object.assign({
   type: 'result', subtype: 'success', is_error: false, duration_ms: 1200, num_turns: 3,
@@ -198,6 +213,18 @@ if (step.addIssues || step.addPrs) {
   s.issues = s.issues.concat(step.addIssues || []);
   s.prs = s.prs.concat(step.addPrs || []);
   fs.writeFileSync(cfg.GH_STATE_FILE, JSON.stringify(s));
+}
+// Stage 73: the codex plan role likewise writes stage files (see the claude
+// twin above) — written to the workspace root the worker reads via readStages.
+if (step.createStages) {
+  const dir = path.join(path.dirname(queueFile), 'stage-instructions');
+  fs.mkdirSync(dir, { recursive: true });
+  step.createStages.forEach((s, i) => {
+    const num = s.number || i + 1;
+    const slug = s.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    fs.writeFileSync(path.join(dir, 'stage-' + num + '-' + slug + '.md'),
+      '# Stage ' + num + ': ' + s.title + '\\n\\n- **Type:** ' + (s.type || 'feature') + '\\n- **Depends on:** none\\n');
+  });
 }
 // Stage 14 (ADR-0011 tier 2): the adversarial half — writes the step scripts
 // into the workspace it was handed (--cd), then a LIVENESS MARKER beside the
@@ -457,6 +484,101 @@ test('e2e: request → plan → build → gated-at-review posts EXACTLY the §7 
     'unlock comment carries outcome gated',
   );
   assert(!labels(state, 30).includes('verity:in-progress'), 'lock label released');
+});
+
+// --- stage 76: a builder must not self-park at review:merge -------------------
+// The observed wedge: a build role opened a green PR but self-reported
+// {outcome:'gated', gate:'review:merge', artifacts:{pr:N}}. gatePause then stamped
+// verity:awaiting-approval on the anchor, which made `next` gate every later tick —
+// so the review role NEVER dispatched and build-through wedged after stage 1. The
+// merge gate is the reviewer's/worker's (T13); the guard coerces a build's gated+PR
+// into the success handoff so review runs.
+
+test('e2e stage 76: a build role that self-reports gated+PR is coerced to a success handoff — review dispatches and merges, build never parks', () => {
+  const fx = fixture({
+    issues: [REQUEST_ISSUE],
+    stages: [{ title: 'Core' }],
+    policy: `${POLICY_SUPERVISED}review:\n  trust: 1\n`,
+    queue: [
+      {
+        final: marker('success', { artifacts: { issues: [31] } }),
+        addIssues: [
+          { number: 31, title: '[stage 1] Core', state: 'OPEN', labels: [], assignees: [] },
+        ],
+      },
+      {
+        // THE BUG: build succeeded (green PR opened) but mis-declared the merge gate.
+        final: marker('gated', { gate: 'review:merge', artifacts: { pr: 114, issues: [31] } }),
+        addPrs: [
+          {
+            number: 114,
+            title: '[stage 1] Core',
+            state: 'OPEN',
+            headRefName: 'feat/stage-1-core',
+            labels: [],
+            statusCheckRollup: [{ conclusion: 'SUCCESS' }],
+            files: ['docs/guide.md', 'README.md'],
+            additions: 10,
+            deletions: 5,
+            checksPass: true,
+          },
+        ],
+      },
+      { final: marker('success', { artifacts: { pr: 114, verdict: 'approve' } }) },
+    ],
+  });
+  const { code, stderr } = runWorker(fx);
+  assertEqual(code, 0, `run exits 0 (stderr: ${stderr})`);
+
+  // Review DISPATCHED after the handoff and squash-merged the PR — proving the
+  // build's mis-declared gate was coerced to success (had it parked, review would
+  // never have run: exactly the wedge this stage fixes).
+  assertEqual(
+    JSON.stringify(mergeCalls(fx)),
+    JSON.stringify([['pr', 'merge', '114', '--squash']]),
+    'review ran after the build handoff and squash-merged the PR',
+  );
+  const state = ghState(fx);
+  assertEqual(itemIn(state, 114).state, 'MERGED', 'the handed-off PR is merged');
+  // No human gate was applied for the BUILD handoff (neither PR nor anchor).
+  assert(
+    !labels(state, 114).includes('verity:awaiting-approval'),
+    'the build handoff never parked the PR at a human gate',
+  );
+  assert(
+    !labels(state, 30).includes('verity:awaiting-approval'),
+    'the anchor is not gate-labeled by the build handoff either',
+  );
+  const summary = comments(state, 30).find((b) => b.startsWith('🤖'));
+  assert(summary.includes('✅ success'), 'the run summarizes success, not gated');
+});
+
+test('e2e stage 76: a build role that reports gated with NO PR still falls through to the existing gate (no over-reach)', () => {
+  const fx = fixture({
+    issues: [REQUEST_ISSUE],
+    stages: [{ title: 'Core' }],
+    queue: [
+      {
+        final: marker('success', { artifacts: { issues: [31] } }),
+        addIssues: [
+          { number: 31, title: '[stage 1] Core', state: 'OPEN', labels: [], assignees: [] },
+        ],
+      },
+      // A genuine no-PR build stop — no artifacts.pr — must be UNTOUCHED by the
+      // guard and fall through to the existing gated handling.
+      { final: marker('gated', {}) },
+    ],
+  });
+  const { code, stderr } = runWorker(fx);
+  assertEqual(code, 0, `gated run exits 0 (stderr: ${stderr})`);
+  // The guard did NOT fire — there is no PR to hand off.
+  assert(
+    !stderr.includes('build role mis-declared a merge gate'),
+    'the coercion note is NOT emitted for a no-PR build stop',
+  );
+  const state = ghState(fx);
+  const summary = comments(state, 30).find((b) => b.startsWith('🤖'));
+  assert(summary.includes('⏸️ gated'), 'the no-PR build still gates (existing handling)');
 });
 
 // --- stage 36: escalate verdict routing (kill-switch review.escalate_routing) -
@@ -888,6 +1010,37 @@ test('cli: missing/malformed --repo and missing --once are usage errors, exit 30
   }
 });
 
+// Stage 52 (#135): the worker interpolates ctx.repo into the `gh api` PATH
+// (index.cjs apiBase, locks.cjs apiBase) and `gh api` truncates the endpoint at
+// `?`/`#`. The old inline check `/^[^/\s]+\/[^/\s]+$/` ACCEPTED 'octo/fixture?'
+// and 'octo/fixture#'. The check is now the shared gh.isRepoSlug.
+test('cli: a --repo carrying ? or # is a usage error (shared gh.isRepoSlug)', () => {
+  const fx = fixture({ policy: null });
+  for (const repo of [
+    'octo/fixture?',
+    'octo/fixture#',
+    'octo/fixture#frag',
+    'octo/fixture/branches/main/protection?',
+    'octo/fix ture',
+  ]) {
+    const { code, stderr } = runWorker(fx, { args: ['--repo', repo, '--once'] });
+    assertEqual(code, 30, `--repo ${repo} exits 30`);
+    assert(stderr.includes('verity-worker: 30 usage:'), `usage slug for --repo ${repo}`);
+    assert(stderr.includes(worker.USAGE), 'prints usage');
+  }
+});
+
+test('cli: a legitimate owner/name using . _ - is still accepted (not a usage error)', () => {
+  const fx = fixture({ policy: null });
+  for (const repo of ['octo/fixture', 'octo-org/my_repo.js', 'Acme.Corp/Widget-2']) {
+    const { stderr } = runWorker(fx, { args: ['--repo', repo, '--once'] });
+    assert(
+      !stderr.includes('verity-worker: 30 usage:'),
+      `--repo ${repo} must NOT be refused as a usage error`,
+    );
+  }
+});
+
 test('cli: invalid autonomy.yml is a startup failure → exit 30 bad-policy', () => {
   const fx = fixture({ policy: 'mode: sideways\n' });
   const { code, stderr } = runWorker(fx);
@@ -965,7 +1118,7 @@ test('gateNameFor: resolves the policy gate for a role, falls back to the role',
 // --- T11: usage ledger wiring + §4.1 daily-limit startup check ---------------------
 
 const USAGE_HEADER =
-  'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate';
+  'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate,provider,model';
 // Pre-stage-3 header — seeded fixtures use it to prove old ledgers keep working.
 const LEGACY_USAGE_HEADER =
   'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome';
@@ -1000,7 +1153,7 @@ test('e2e: SUMMARIZE appends exactly one §3.4 usage.csv row for a zero-role run
   assertEqual(lines[0], USAGE_HEADER, 'header row required, exact §3.4 columns');
   assertEqual(lines.length, 2, 'exactly one data row for the run');
   const cells = lines[1].split(',');
-  assertEqual(cells.length, 12, '12 columns');
+  assertEqual(cells.length, 14, '14 columns (stage-53 provider,model appended)');
   assert(!Number.isNaN(Date.parse(cells[0])), 'timestamp parses');
   assert(/^run-/.test(cells[1]), 'run_id');
   assertEqual(cells[2], 'octo/fixture', 'repo');
@@ -1056,6 +1209,15 @@ test('e2e: a run over N roles appends N usage.csv rows sharing ONE run_id (stage
     'each row is attributed to its role, in invocation order',
   );
   assertEqual(rows.map((c) => c[9]).join('|'), '4|31|7', 'per-role tool_calls from the transcript');
+  // Stage 53: the worker stamps the run's resolved agentCfg provenance on every
+  // row — provider from the frozen config (claude default here), model '' for a
+  // null model. Populated end-to-end, never fabricated.
+  assertEqual(
+    rows.map((c) => c[12]).join('|'),
+    'claude|claude|claude',
+    'stage 53: each row records the run provider',
+  );
+  assertEqual(rows.map((c) => c[13]).join('|'), '||', 'stage 53: a null model → empty cell');
   assertEqual(
     rows.map((c) => c[8]).join('|'),
     'success|success|gated',
@@ -1759,6 +1921,31 @@ test('tier gating: SUPERVISED codex at tier 1 still runs; tier 2 permits autonom
   assertEqual(claudeRes.code, 0, `claude autonomy is untouched (stderr: ${claudeRes.stderr})`);
 });
 
+test('stage 54 tier gating: a per-role codex override is refused at startup, before any gh call', () => {
+  // base is claude (would run), but a per-role review:codex override under
+  // autonomous without tier-2 must refuse the WHOLE run at startup — a per-role
+  // codex override can never bypass tier-2 (ADR-0024).
+  const fx = fixture({
+    issues: [REQUEST_ISSUE],
+    policy: 'mode: autonomous\nagent:\n  roles:\n    review:\n      provider: codex\n',
+  });
+  const { code, stderr } = runWorker(fx, { env: codexEnv(fx) });
+  assertEqual(code, 30, 'the per-role codex override refuses the run');
+  assertErrorLine(stderr, 30, 'containment-tier-required');
+  assert(stderr.includes("role 'review'"), 'the error names the offending role');
+  assert(!fs.existsSync(fx.callsFile), 'refused before ANY gh call, scan, or lock');
+  assertEqual(codexArgvs(fx).length, 0, 'and the agent was never invoked');
+
+  // The same per-role override WITH tier 2 gets past the gate (idle → exit 0).
+  const ok = fixture({
+    policy:
+      'mode: autonomous\nagent:\n  roles:\n    review:\n      provider: codex\n      containment_tier: 2\n',
+  });
+  const okRes = runWorker(ok, { env: codexEnv(ok) });
+  assertEqual(okRes.code, 0, `per-role tier-2 is permitted (stderr: ${okRes.stderr})`);
+  assert(!okRes.stderr.includes('containment-tier-required'), 'the per-role gate did not fire');
+});
+
 test('assertContainmentTier: unit — the exact matrix, fail closed', () => {
   const cfg = (agent) => worker.resolveEffectiveAgent({ agent });
   const refuses = (mode, agent) => {
@@ -1791,6 +1978,84 @@ test('assertContainmentTier: unit — the exact matrix, fail closed', () => {
   assertEqual(refuses('autonomous', { provider: 'claude' }), null, 'claude has no tiers');
   assertEqual(refuses('autonomous', {}), null, 'a pre-stage-9 policy is claude-backed');
   assertEqual(worker.resolveEffectiveAgent({}).containment_tier, 1, 'the default tier is 1');
+});
+
+// Stage 79 (ADR-0029) shipped the delivery-substrate seam as a fail-closed
+// refusal; stage 83 LIFTS it — the local driver is complete (stages 80–82), so
+// a `substrate: local` policy now PROCEEDS at startup. The P5 snapshot then
+// routes through the local acquirer (fetchLocalSnapshot), so the fixture needs
+// a REAL git repo (git:true) for the PR half to be observable.
+test('stage 83 substrate: a local-substrate policy PROCEEDS at startup (refusal lifted; drivers complete)', () => {
+  const fx = fixture({
+    git: true,
+    policy: 'mode: supervised\nsubstrate: local\n',
+  });
+  const { code, stderr } = runWorker(fx);
+  assertEqual(code, 0, `a local-substrate run proceeds past the seam gate (stderr: ${stderr})`);
+  assert(
+    !stderr.includes('substrate-unimplemented'),
+    'the stage-79 placeholder refusal no longer fires for local',
+  );
+
+  // An explicit github substrate is byte-identical to absent: the run proceeds.
+  const ok = fixture({ policy: 'mode: supervised\nsubstrate: github\n' });
+  const okRes = runWorker(ok);
+  assertEqual(okRes.code, 0, `explicit github runs (stderr: ${okRes.stderr})`);
+  assert(!okRes.stderr.includes('substrate-unimplemented'), 'the seam gate did not fire');
+});
+
+// Stage 54 (ADR-0024): containment is enforced PER ROLE — a per-role codex
+// override can NEVER bypass tier-2, and the check is strictly more fail-closed.
+test('stage 54 containment: a per-role codex override is tier-gated per role', () => {
+  const refuses = (policy) => {
+    try {
+      worker.assertContainmentTier(policy, worker.resolveEffectiveAgent(policy));
+      return null;
+    } catch (err) {
+      return err.slug;
+    }
+  };
+  // base claude, review overridden to codex at the DEFAULT tier ⇒ refused.
+  assertEqual(
+    refuses({ mode: 'autonomous', agent: { roles: { review: { provider: 'codex' } } } }),
+    'containment-tier-required',
+    'a per-role codex role under autonomous without tier-2 is refused',
+  );
+  // the same role WITH tier 2 ⇒ allowed.
+  assertEqual(
+    refuses({
+      mode: 'autonomous',
+      agent: { roles: { review: { provider: 'codex', containment_tier: 2 } } },
+    }),
+    null,
+    'tier-2 on the per-role override permits the run',
+  );
+  // a per-role CLAUDE override is unaffected (base claude, role claude).
+  assertEqual(
+    refuses({ mode: 'autonomous', agent: { roles: { build: { model: 'cheap' } } } }),
+    null,
+    'a claude per-role override needs no tier',
+  );
+  // supervised is unaffected even with a per-role codex role.
+  assertEqual(
+    refuses({ mode: 'supervised', agent: { roles: { review: { provider: 'codex' } } } }),
+    null,
+    'supervised is allowed at tier 1, per role too',
+  );
+  // base codex tier-2 (allowed) but a per-role override drops back to tier-1 ⇒
+  // refused: the override can only ever tighten, and the check catches a loosen.
+  assertEqual(
+    refuses({
+      mode: 'autonomous',
+      agent: {
+        provider: 'codex',
+        containment_tier: 2,
+        roles: { review: { containment_tier: 1 } },
+      },
+    }),
+    'containment-tier-required',
+    'a per-role tier-1 override under an autonomous codex run is refused',
+  );
 });
 
 // One immutable effective config per run (in-process, agentExec/next patched):
@@ -1880,6 +2145,224 @@ test('runLoop: one immutable agent config per run; --timeout-secs shrinks across
     agentExecMod.dispatch = origDispatch;
     nextMod.dispatch = origNext;
   }
+});
+
+// Stage 73 (#202): the P4-first `plan` synthesis is UNCONDITIONAL — it does NOT
+// key on the stage count. A P4 selection means the scanner found an OPEN
+// `verity:request`, and a request stays labeled only while it is un-planned
+// (retirement below removes the label after a successful plan). So a pending
+// request must plan whether or not prior work's stages already exist on disk —
+// this is Mode B recurring intake. A stage-count guard here would have blocked
+// it; this test locks the guard OUT.
+test('runLoop: a P4-first plan is synthesized regardless of existing stage count (Mode B intake)', () => {
+  const agentExecMod = require('../verity/bin/lib/agent-exec.cjs');
+  const nextMod = require('../verity/bin/lib/next.cjs');
+  const ledgerMod = require('../verity/bin/lib/ledger.cjs');
+  const ghMod = require('../verity/bin/lib/gh.cjs');
+  const autonomyMod = require('../verity/bin/lib/autonomy.cjs');
+  const policy = JSON.parse(JSON.stringify(autonomyMod.DEFAULTS));
+  policy.mode = 'supervised';
+
+  const origDispatch = agentExecMod.dispatch;
+  const origNext = nextMod.dispatch;
+  const origReadStages = ledgerMod.readStages;
+  const origRun = ghMod.run;
+  const origJson = ghMod.json;
+
+  const firstRole = (stages) => {
+    const calls = [];
+    // Stub gh so the retirement removeLabel (a worker-side gh write that fires
+    // when a plan succeeds WITH stages present) never hits a real `gh` — which
+    // has no GH_TOKEN under CI. The engine behaviour is unchanged; only the
+    // network call is captured.
+    ghMod.run = () => '';
+    ghMod.json = () => [];
+    ledgerMod.readStages = () => stages;
+    agentExecMod.dispatch = (args) => {
+      calls.push(args[0]);
+      return {
+        schema: 1,
+        role: args[0],
+        outcome: 'success',
+        tokens: { in: 1, out: 1 },
+        est_usd: 0.01,
+        wall_secs: 1,
+        tool_calls: 0,
+        artifacts: {},
+        error: null,
+      };
+    };
+    // If synthesis were (wrongly) keyed on the stage count, a non-empty stage
+    // list would route iteration one through next.dispatch and yield 'build'.
+    nextMod.dispatch = () => ({
+      schema: 1,
+      action: 'idle',
+      role: null,
+      args: [],
+      gate: null,
+      target: null,
+      reason: 'done',
+    });
+    worker.runLoop(
+      { repo: 'o/r', cwd: '/tmp', stdout() {}, stderr() {} },
+      { policy, runId: 'run-mode-b', item: { kind: 'issue', number: 30, tier: 'P4' } },
+    );
+    return calls[0];
+  };
+
+  try {
+    assertEqual(firstRole([]), 'plan', '0 stages ⇒ plan synthesized (as always)');
+    assertEqual(
+      firstRole([{ number: 1, title: 'Prior', type: 'feature', dependsOn: [], file: '1.md' }]),
+      'plan',
+      'prior stages present ⇒ STILL plans the pending request (Mode B, no stage-count guard)',
+    );
+  } finally {
+    agentExecMod.dispatch = origDispatch;
+    nextMod.dispatch = origNext;
+    ledgerMod.readStages = origReadStages;
+    ghMod.run = origRun;
+    ghMod.json = origJson;
+  }
+});
+
+// Stage 73 (#202): retirement is the SOLE anti-thrash mechanism. After a
+// successful plan that produced stages, the worker retires the request's
+// `verity:request` trigger (a worker-side gh write the contained plan role
+// cannot perform), so the P4 tier never re-selects the now-planned request.
+// Fires ONLY on outcome:success with stages on disk; a failed/limit_hit plan
+// never reaches it (they return earlier) and can never strand an un-planned
+// request with its trigger removed. Idempotent (removeLabel tolerates 404).
+test('runLoop: a successful P4 plan retires verity:request; failed/limit_hit does NOT', () => {
+  const agentExecMod = require('../verity/bin/lib/agent-exec.cjs');
+  const nextMod = require('../verity/bin/lib/next.cjs');
+  const ledgerMod = require('../verity/bin/lib/ledger.cjs');
+  const ghMod = require('../verity/bin/lib/gh.cjs');
+  const autonomyMod = require('../verity/bin/lib/autonomy.cjs');
+
+  const origDispatch = agentExecMod.dispatch;
+  const origNext = nextMod.dispatch;
+  const origReadStages = ledgerMod.readStages;
+  const origRun = ghMod.run;
+  const origJson = ghMod.json;
+
+  let ghCalls;
+  const deleteLabelCalls = () =>
+    ghCalls
+      .filter(
+        (a) =>
+          a[0] === 'api' && a[1] === '-X' && a[2] === 'DELETE' && String(a[3]).includes('/labels/'),
+      )
+      .map((a) => decodeURIComponent(String(a[3]).split('/labels/')[1]));
+
+  const run = ({ planOutcome, maxTokens }) => {
+    ghCalls = [];
+    ghMod.run = (args) => {
+      ghCalls.push(args);
+      return '';
+    };
+    ghMod.json = () => [];
+    // Empty until the plan runs, then a stage appears — mirroring a real plan
+    // writing stage files in-run.
+    const stages = [];
+    ledgerMod.readStages = () => stages;
+    agentExecMod.dispatch = (args) => {
+      if (args[0] === 'plan') {
+        stages.push({ number: 1, title: 't', type: 'feature', dependsOn: [], file: '1.md' });
+      }
+      return {
+        schema: 1,
+        role: args[0],
+        outcome: planOutcome,
+        tokens: { in: 1, out: 1 },
+        est_usd: 0.01,
+        wall_secs: 1,
+        tool_calls: 0,
+        artifacts: {},
+        error: planOutcome === 'failed' ? 'boom' : null,
+      };
+    };
+    nextMod.dispatch = () => ({
+      schema: 1,
+      action: 'idle',
+      role: null,
+      args: [],
+      gate: null,
+      target: null,
+      reason: 'done',
+    });
+    const policy = JSON.parse(JSON.stringify(autonomyMod.DEFAULTS));
+    policy.mode = 'supervised';
+    if (typeof maxTokens === 'number') {
+      policy.limits.max_tokens_per_run = maxTokens;
+    }
+    return worker.runLoop(
+      { repo: 'o/r', cwd: '/tmp', stdout() {}, stderr() {} },
+      { policy, runId: 'run-retire', item: { kind: 'issue', number: 42, tier: 'P4' } },
+    );
+  };
+
+  try {
+    const ok = run({ planOutcome: 'success' });
+    assertEqual(ok.outcome, 'success', 'plan success chained to idle');
+    assert(deleteLabelCalls().includes('verity:request'), 'successful plan retires verity:request');
+
+    run({ planOutcome: 'failed' });
+    assert(
+      !deleteLabelCalls().includes('verity:request'),
+      'a FAILED plan never retires verity:request',
+    );
+
+    const limited = run({ planOutcome: 'success', maxTokens: 0 });
+    assertEqual(limited.outcome, 'limit_hit', 'a zero token budget trips before dispatch');
+    assert(
+      !deleteLabelCalls().includes('verity:request'),
+      'a limit_hit plan never retires verity:request',
+    );
+  } finally {
+    agentExecMod.dispatch = origDispatch;
+    nextMod.dispatch = origNext;
+    ledgerMod.readStages = origReadStages;
+    ghMod.run = origRun;
+    ghMod.json = origJson;
+  }
+});
+
+// Stage 73 (#202) — the multi-request anti-regression, end to end: a NEW pending
+// `verity:request` co-existing with stages from PRIOR work is still planned
+// (P4-selected → plan synthesized), and the plan's success retires its trigger.
+// This is exactly the Mode B recurring intake a global stage-count guard would
+// have broken.
+test('e2e (stage 73): a NEW request is planned even when prior stages exist, then retired', () => {
+  const fx = fixture({
+    issues: [REQUEST_ISSUE],
+    stages: [{ title: 'Prior' }], // stages from earlier work already on disk
+    queue: [
+      {
+        // the plan role for the NEW request: it writes a fresh stage (2) and its
+        // work-item issue. A global stage-count guard would have BLOCKED this.
+        createStages: [{ title: 'Fresh', number: 2 }],
+        final: marker('success', { artifacts: { issues: [32] } }),
+        addIssues: [
+          { number: 32, title: '[stage 2] Fresh', state: 'OPEN', labels: [], assignees: [] },
+        ],
+      },
+      { final: marker('gated', { gate: 'build' }) }, // stop the chain cleanly
+    ],
+  });
+  const { code, stderr } = runWorker(fx);
+  assertEqual(code, 0, `run exits 0 (stderr: ${stderr})`);
+  const state = ghState(fx);
+  const summary = comments(state, 30).find((b) => b.startsWith('🤖'));
+  assert(summary !== undefined, 'the §7 summary landed on the request issue');
+  assert(
+    summary.includes('roles: plan'),
+    `the NEW request WAS planned despite prior stages, got: ${summary}`,
+  );
+  assert(
+    !labels(state, 30).includes('verity:request'),
+    'retirement removed the planned request’s trigger — the P4 tier will not re-select it',
+  );
 });
 
 test('runLoop: a claude-default policy dispatches agent claude with NO codex knobs', () => {
@@ -1984,6 +2467,86 @@ test('runLoop: containment_tier 2 reaches EVERY chained dispatch as --containmen
   }
 });
 
+// ADR-0026 (stage 64): agent.reconcile_work_items maps to --reconcile-work-items
+// in the plan dispatch, omitted-in — only an explicit true travels. Mirrors the
+// containment-tier dispatch-flag precedent. A shared harness so the base, per-role,
+// and unset (byte-identical) paths are all read off the SAME dispatch machinery.
+const runReconcileDispatch = (mutatePolicy) => {
+  const agentExecMod = require('../verity/bin/lib/agent-exec.cjs');
+  const nextMod = require('../verity/bin/lib/next.cjs');
+  const autonomyMod = require('../verity/bin/lib/autonomy.cjs');
+  const policy = JSON.parse(JSON.stringify(autonomyMod.DEFAULTS));
+  policy.mode = 'supervised';
+  mutatePolicy(policy);
+  const calls = [];
+  const origDispatch = agentExecMod.dispatch;
+  const origNext = nextMod.dispatch;
+  agentExecMod.dispatch = (args, flags) => {
+    calls.push({ role: args[0], flags: { ...flags } });
+    return {
+      schema: 1,
+      role: args[0],
+      outcome: 'gated',
+      tokens: { in: 1, out: 1 },
+      est_usd: 0.01,
+      wall_secs: 1,
+      tool_calls: 0,
+      artifacts: {},
+      error: null,
+    };
+  };
+  nextMod.dispatch = () => ({
+    schema: 1,
+    action: 'work',
+    role: 'plan',
+    args: ['31'],
+    gate: null,
+    target: { kind: 'stage', number: null },
+    reason: 'stage ready',
+  });
+  try {
+    worker.runLoop(
+      { repo: 'o/r', cwd: '/tmp', stdout() {}, stderr() {} },
+      { policy, runId: 'run-reconcile', item: { kind: 'stage', number: null, tier: 'P5' } },
+    );
+    return calls;
+  } finally {
+    agentExecMod.dispatch = origDispatch;
+    nextMod.dispatch = origNext;
+  }
+};
+
+test('runLoop: agent.reconcile_work_items true reaches the plan dispatch as --reconcile-work-items', () => {
+  const calls = runReconcileDispatch((policy) => {
+    policy.agent = { ...policy.agent, reconcile_work_items: true };
+  });
+  assertEqual(calls.length, 1, 'one plan dispatch');
+  assertEqual(calls[0].role, 'plan', 'the plan role');
+  assertEqual(calls[0].flags['reconcile-work-items'], true, 'the flag travels when set true');
+});
+
+test('runLoop: reconcile_work_items absent OR false is omitted-in — byte-identical dispatch', () => {
+  const absent = runReconcileDispatch(() => {}); // DEFAULTS carry no reconcile_work_items
+  assert(
+    !('reconcile-work-items' in absent[0].flags),
+    'absent ⇒ no flag key (pre-stage-63 policy dispatches byte-identically)',
+  );
+  const explicitFalse = runReconcileDispatch((policy) => {
+    policy.agent = { ...policy.agent, reconcile_work_items: false };
+  });
+  assert(
+    !('reconcile-work-items' in explicitFalse[0].flags),
+    'explicit false ⇒ no flag key (still byte-identical)',
+  );
+});
+
+test('runLoop: a per-role plan reconcile_work_items override also carries', () => {
+  const calls = runReconcileDispatch((policy) => {
+    policy.agent = { ...policy.agent, roles: { plan: { reconcile_work_items: true } } };
+  });
+  assertEqual(calls[0].flags['reconcile-work-items'], true, 'per-role plan override travels');
+});
+
 test('remainingTimeoutSecs: monotonically non-increasing, floored at 1', () => {
   const limits = { max_wall_clock_min: 45 };
   assertEqual(worker.remainingTimeoutSecs(limits, 0), 2700, 'full budget at t0');
@@ -2017,6 +2580,147 @@ test('resolveEffectiveAgent: frozen — the run config cannot drift mid-run', ()
   assertEqual(cfg.provider, 'codex');
   const legacy = worker.resolveEffectiveAgent({}); // pre-stage-9 policy object
   assertEqual(legacy.provider, 'claude', 'missing agent block defaults to claude');
+});
+
+// Stage 54 (ADR-0024): resolution is still once-per-run and frozen, just keyed
+// by role. agentForRole returns the base when no override, the merged config
+// when set, and the whole map is snapshotted at resolution — a later mutation
+// of the policy object changes nothing (proving no mid-run policy re-read).
+test('stage 54 resolveEffectiveAgent: agentForRole resolves once and freezes', () => {
+  const policy = {
+    agent: {
+      provider: 'claude',
+      roles: {
+        build: { model: 'cheap-model' },
+        review: { provider: 'codex', model: 'gpt-5-codex', containment_tier: 2 },
+      },
+    },
+  };
+  const resolved = worker.resolveEffectiveAgent(policy);
+  // The base is still exposed at the top level AND via `.base`.
+  assertEqual(resolved.provider, 'claude', 'base provider still read run-wide');
+  assertEqual(resolved.base.provider, 'claude', 'and via the .base handle');
+
+  // No override ⇒ the base itself (byte-identical to today for that role).
+  assertEqual(resolved.agentForRole('plan').provider, 'claude', 'no override ⇒ base');
+  assertEqual(resolved.agentForRole('plan'), resolved.base, 'literally the frozen base object');
+
+  // Overridden roles get their own provider/model, merged over the base.
+  assertEqual(resolved.agentForRole('build').model, 'cheap-model', 'per-role model override');
+  assertEqual(resolved.agentForRole('build').provider, 'claude', 'unset keys inherit the base');
+  assertEqual(resolved.agentForRole('review').provider, 'codex', 'per-role provider override');
+  assertEqual(resolved.agentForRole('review').containment_tier, 2, 'per-role tier override');
+  assert(Object.isFrozen(resolved.agentForRole('review')), 'each per-role config is frozen');
+
+  // Mutate the policy AFTER resolution — the resolver must not see it.
+  policy.agent.provider = 'codex';
+  policy.agent.roles.review.provider = 'claude';
+  policy.agent.roles.build.model = 'expensive-model';
+  policy.agent.roles.plan = { provider: 'codex' };
+  assertEqual(resolved.agentForRole('review').provider, 'codex', 'frozen: role override unchanged');
+  assertEqual(resolved.agentForRole('build').model, 'cheap-model', 'frozen: role model unchanged');
+  assertEqual(resolved.provider, 'claude', 'frozen: base provider unchanged');
+  assertEqual(
+    resolved.agentForRole('plan'),
+    resolved.base,
+    'a role added post-resolution is invisible',
+  );
+});
+
+// Stage 54 (ADR-0024): each role's dispatch uses ITS OWN --agent/--model, and
+// its provider/model lands on that role's usage row (stage 53). A codex role's
+// dispatch also carries its own knobs; a claude role's does not.
+test('stage 54 runLoop: each role dispatches under its own provider/model + provenance', () => {
+  const agentExecMod = require('../verity/bin/lib/agent-exec.cjs');
+  const nextMod = require('../verity/bin/lib/next.cjs');
+  const autonomyMod = require('../verity/bin/lib/autonomy.cjs');
+  const policy = JSON.parse(JSON.stringify(autonomyMod.DEFAULTS));
+  policy.mode = 'supervised';
+  policy.limits.unknown_cost_behavior = 'allow_with_token_limit';
+  // build → a cheap claude model; review → codex with its own model + tier 2.
+  policy.agent = {
+    ...policy.agent,
+    provider: 'claude',
+    roles: {
+      build: { model: 'cheap-model' },
+      review: { provider: 'codex', model: 'gpt-5-codex', containment_tier: 2 },
+    },
+  };
+  const calls = [];
+  const origDispatch = agentExecMod.dispatch;
+  const origNext = nextMod.dispatch;
+  agentExecMod.dispatch = (args, flags) => {
+    calls.push({ role: args[0], flags: { ...flags } });
+    // build succeeds (chain to review); review gates.
+    return {
+      schema: 1,
+      role: args[0],
+      outcome: args[0] === 'review' ? 'gated' : 'success',
+      tokens: { in: 10, out: 5 },
+      est_usd: 0.02,
+      wall_secs: 1,
+      tool_calls: 0,
+      artifacts: {},
+      error: null,
+    };
+  };
+  let n = 0;
+  nextMod.dispatch = () => {
+    n += 1;
+    const role = n === 1 ? 'build' : 'review';
+    return {
+      schema: 1,
+      action: 'work',
+      role,
+      args: ['31'],
+      gate: null,
+      target: { kind: 'stage', number: null },
+      reason: 'stage ready',
+    };
+  };
+  try {
+    const summary = worker.runLoop(
+      { repo: 'o/r', cwd: '/tmp', stdout() {}, stderr() {} },
+      { policy, runId: 'run-per-role', item: { kind: 'stage', number: null, tier: 'P5' } },
+    );
+    assertEqual(summary.outcome, 'gated', 'build succeeded then review gated');
+    assertEqual(calls.length, 2, 'two dispatches');
+    const build = calls.find((c) => c.role === 'build');
+    const review = calls.find((c) => c.role === 'review');
+    assertEqual(build.flags.agent, 'claude', 'build stays claude');
+    assertEqual(build.flags.model, 'cheap-model', 'build uses its per-role model');
+    assert(!('containment-tier' in build.flags), 'a claude role carries no codex tier');
+    assertEqual(review.flags.agent, 'codex', 'review is the per-role codex override');
+    assertEqual(review.flags.model, 'gpt-5-codex', 'review uses its per-role model');
+    assertEqual(review.flags['containment-tier'], 2, 'review carries its own tier-2');
+
+    // Stage 53 provenance, now per role: each invocation row records its own.
+    const rows = summary.invocations;
+    assertEqual(rows.find((r) => r.role === 'build').provider, 'claude');
+    assertEqual(rows.find((r) => r.role === 'build').model, 'cheap-model');
+    assertEqual(rows.find((r) => r.role === 'review').provider, 'codex');
+    assertEqual(rows.find((r) => r.role === 'review').model, 'gpt-5-codex');
+  } finally {
+    agentExecMod.dispatch = origDispatch;
+    nextMod.dispatch = origNext;
+  }
+});
+
+// Stage 54 (ADR-0024): the kill-switch. With NO agent.roles map, the resolved
+// dispatch argv + provenance for a role are byte-identical to reading the base
+// config directly — proving absent roles ⇒ identical to pre-stage-54.
+test('stage 54 byte-identical: no agent.roles ⇒ every role resolves to the base', () => {
+  const autonomyMod = require('../verity/bin/lib/autonomy.cjs');
+  const policy = JSON.parse(JSON.stringify(autonomyMod.DEFAULTS));
+  policy.agent = { ...policy.agent, provider: 'codex', model: 'gpt-5-codex', containment_tier: 2 };
+  const resolved = worker.resolveEffectiveAgent(policy);
+  for (const role of autonomyMod.KNOWN_AGENT_ROLES) {
+    assertEqual(
+      resolved.agentForRole(role),
+      resolved.base,
+      `${role} resolves to the identical frozen base object (kill-switch OFF)`,
+    );
+  }
 });
 
 test('recordUsage: ledger errors are logged, never thrown (run outcome unchanged)', () => {
@@ -2376,6 +3080,18 @@ const STAGE_WORK = (number = null) => ({
   reason: 'stage ready',
 });
 const NULL_STAGE = { kind: 'stage', number: null, tier: 'P5' };
+// A terminal dispatch decision: the dependency engine finds no more work, so the
+// run idles to a clean success. Used to let a COERCED build-success (stage 76)
+// chain to a terminal tick instead of re-dispatching into an empty result queue.
+const IDLE_PLAN = {
+  schema: 1,
+  action: 'idle',
+  role: null,
+  args: [],
+  gate: null,
+  target: null,
+  reason: 'no work remaining',
+};
 
 test('stage 37 REGRESSION: a null-anchor stage build (success, est_usd null) that opened a PR announces the unknown-cost gate ON THAT PR, with the stage-31 parked pointer', () => {
   const gh = patchTargetedPosts();
@@ -2433,22 +3149,32 @@ test('stage 37: a null-anchor stage build that FAILED with unknown cost announce
   }
 });
 
-test('stage 37: a null-anchor stage role that returned outcome gated announces on the opened PR', () => {
+// Stage 76 supersedes the original stage-37 build-gate case. That test used a
+// build role self-reporting outcome `gated` with an opened PR to exercise the
+// null-anchor → opened-PR gate-announce fallback — but that exact result is now
+// the diagnosed wedge (a builder never owns the merge gate, T13), so the guard
+// coerces it to the success handoff BEFORE any gate is announced. The null-anchor
+// → PR fallback stays covered by the sibling unknown-cost test above (build
+// SUCCESS + est_usd null ⇒ unknown-cost gate on the opened PR).
+test('stage 76: a null-anchor build that self-reports outcome gated WITH a PR is coerced to a success handoff — NO gate parks on the PR', () => {
   const gh = patchTargetedPosts();
   try {
     const summary = runStage37(
       NULL_STAGE,
+      // The wedge: a build opened green PR #11 but mis-declares a merge gate.
+      // Stage 76 coerces it to a success handoff, so the run chains and idles.
       [RESULT({ role: 'build', outcome: 'gated', est_usd: 0.5, artifacts: { pr: 11 } })],
-      [STAGE_WORK()],
+      [STAGE_WORK(), IDLE_PLAN],
     );
-    assertEqual(summary.outcome, 'gated');
+    assertEqual(summary.outcome, 'success', 'the build gate was coerced to a success handoff');
     assert(
-      gh.labelsOn(11).includes('verity:awaiting-approval'),
-      'the role-gated park lands on PR #11',
+      !gh.labelsOn(11).includes('verity:awaiting-approval'),
+      `the build handoff never parks a human gate on PR #11 (got: ${JSON.stringify(gh.posts)})`,
     );
-    assert(
-      gh.commentsOn(11).some((b) => b.startsWith('⏸️')),
-      'a gate comment was posted on the opened PR',
+    assertEqual(
+      gh.commentsOn(11).filter((b) => b.startsWith('⏸️')).length,
+      0,
+      'no gate comment posted on the handed-off PR',
     );
   } finally {
     gh.restore();

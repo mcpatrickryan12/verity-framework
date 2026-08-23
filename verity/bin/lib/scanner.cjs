@@ -47,6 +47,13 @@
 // normalize, byCreatedAt, NEEDS_HUMAN_LABEL.
 const gh = require('./gh.cjs');
 const next = require('./next.cjs');
+// Stage 85 (ADR-0029; stage-83 review): the LOCAL substrate's tier source. The
+// tier queries are gh list calls, which a `substrate: local` run must never
+// spawn — the honest local equivalent reads the contract record store
+// (labels are ON the records; contract local-work-item v1, frozen), so the
+// tiers filter the SAME label vocabulary over the same carrier the rest of the
+// engine reads. github/absent: byte-identical gh queries (spawn-arg pinned).
+const substrateLocal = require('./substrate-local.cjs');
 
 const NEEDS_HUMAN_LABEL = 'verity:needs-human';
 
@@ -161,6 +168,35 @@ function byCreatedAt(a, b) {
   return a.number - b.number;
 }
 
+// Stage 85 (ADR-0029): one tier query answered from the LOCAL record store.
+// The label filter is the query's own `--label` value, matched
+// case-insensitively (gh's label filtering is); `--state open` is the tiers'
+// only state filter, so OPEN records are the universe. Only `issue`-kind
+// queries have a local carrier: labels live on work-item records ONLY
+// (contract local-work-item v1 — the synthesized local PRs carry labels:[]
+// by design), so a `pr list --label` query honestly answers empty rather
+// than fabricating a PR-side label read that has no local source.
+// listWorkItems THROWS on an unreadable/corrupt record — same failure
+// direction as a thrown gh list query, never a quiet "no matches".
+function localTierItems(cwd, q, tier) {
+  if (q.kind !== 'issue') {
+    return [];
+  }
+  const label = String(q.args[q.args.indexOf('--label') + 1]).toLowerCase();
+  return substrateLocal
+    .listWorkItems(cwd)
+    .filter(
+      (rec) => rec.state === 'OPEN' && rec.labels.some((l) => String(l).toLowerCase() === label),
+    )
+    .map((rec) =>
+      normalize(
+        { number: rec.number, title: rec.title, labels: rec.labels, createdAt: rec.created_at },
+        q.kind,
+        tier,
+      ),
+    );
+}
+
 function scan(opts = {}) {
   const ghOpts = {
     cwd: opts.cwd,
@@ -170,13 +206,20 @@ function scan(opts = {}) {
     log: opts.log,
     retries: opts.retries,
   };
+  // Stage 85 (ADR-0029): the resolved delivery substrate, threaded by the
+  // worker (ctx.substrate). Absent/'github' ⇒ the gh tier queries below,
+  // byte-identical; 'local' answers every tier from the record store with
+  // ZERO gh spawns (the whole point of the substrate).
+  const local = opts.substrate === 'local';
   const isLocked = opts.isLocked || (() => false);
   const botLogin = opts.botLogin ? String(opts.botLogin).toLowerCase() : null;
   const warn = opts.warn || (() => {});
 
   for (const [tier, queries] of Object.entries(TIER_QUERIES)) {
     let items = queries.flatMap((q) =>
-      gh.json(q.args, ghOpts).map((raw) => normalize(raw, q.kind, tier)),
+      local
+        ? localTierItems(opts.cwd, q, tier)
+        : gh.json(q.args, ghOpts).map((raw) => normalize(raw, q.kind, tier)),
     );
     items = items.filter((it) => !it.labels.includes(NEEDS_HUMAN_LABEL));
     if (tier === 'P4' && botLogin !== null) {
@@ -210,7 +253,13 @@ function scan(opts = {}) {
       kind: decision.target.kind,
       number: decision.target.number,
       title: null,
-      labels: fetchTargetLabels(decision.target, ghOpts),
+      // Stage 85: the substrate rides in the ghOpts bag ONLY on local (the
+      // stage-84 finding-2 discipline) — a github scan's fetch keeps the same
+      // clean bag it always had.
+      labels: fetchTargetLabels(
+        decision.target,
+        local ? { ...ghOpts, substrate: 'local' } : ghOpts,
+      ),
       createdAt: null,
       author: null,
       headRefName: null,
@@ -240,6 +289,28 @@ function fetchTargetLabels(target, ghOpts) {
     return [];
   }
   const noun = target.kind;
+  // Stage 85 (ADR-0029): on the local substrate the fresh per-item read is the
+  // work-item RECORD (issues and local PRs share its number space — synthesizePr
+  // numbers a stage's PR by its record). A branch that never had a record (the
+  // display-only fallback numbering) has no label carrier at all ⇒ [] for a
+  // `pr` target; a MISSING record behind an `issue` target, or any
+  // unreadable/corrupt record, fails CLOSED to null exactly like a failed gh
+  // view — never guessed. Zero gh spawns on this path.
+  if (ghOpts && ghOpts.substrate === 'local') {
+    const cwd = ghOpts.cwd || process.cwd();
+    try {
+      return substrateLocal.readWorkItem(cwd, target.number).labels.map((l) => l.toLowerCase());
+    } catch (err) {
+      if (noun === 'pr' && /no local work-item record/.test(String(err.message))) {
+        return [];
+      }
+      const warn = ghOpts.log || ((line) => process.stderr.write(`${line}\n`));
+      warn(
+        `scanner: P5 local record read failed for ${noun} #${target.number} (${err.message || err}) — failing closed (idle)`,
+      );
+      return null;
+    }
+  }
   try {
     const raw = gh.json([noun, 'view', String(target.number), '--json', 'labels'], ghOpts);
     return labelNames(raw);

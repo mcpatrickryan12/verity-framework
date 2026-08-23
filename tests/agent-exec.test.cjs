@@ -14,6 +14,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const agentExec = require('../verity/bin/lib/agent-exec.cjs');
+const stage = require('../verity/bin/lib/stage.cjs');
 
 const CLI = path.join(__dirname, '..', 'verity', 'bin', 'verity.cjs');
 
@@ -466,4 +467,154 @@ test('exitCodeFor: outcome → 0/10/20/30 map', () => {
   assertEqual(agentExec.exitCodeFor({ outcome: 'failed' }), 20);
   assertEqual(agentExec.exitCodeFor({ outcome: 'infra_error' }), 30);
   assertEqual(agentExec.exitCodeFor({}), 30, 'unknown outcome is infra');
+});
+
+// --- Stage 63 (ADR-0026, #176): worker-owned work-item reconciliation ---
+// A stub `gh` on PATH stands in for the worker's ambient GitHub access: it
+// answers `issue list` from an empty store and logs every `issue create` title,
+// so the tests assert WHAT the worker created without touching the network.
+const GH_STUB = `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const flag = (f) => { const i = args.indexOf(f); return i === -1 ? undefined : args[i + 1]; };
+if (args[0] === 'issue' && args[1] === 'list') { process.stdout.write('[]'); process.exit(0); }
+if (args[0] === 'issue' && args[1] === 'create') {
+  fs.appendFileSync(process.env.GH_CREATE_LOG, (flag('--title') || '') + '\\n');
+  process.stdout.write('https://github.com/x/y/issues/1\\n');
+  process.exit(0);
+}
+process.exit(0);
+`;
+
+// Install the gh stub on PATH, pre-write a plan stage file into the run cwd (the
+// plan agent's merged-back artifact), and return the create-log path + a PATH
+// that keeps the real `node` reachable.
+function planReconcileFixture(fx) {
+  const bin = path.join(fx.dir, 'stub-bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'gh'), GH_STUB);
+  fs.chmodSync(path.join(bin, 'gh'), 0o755);
+  const createLog = path.join(fx.dir, 'gh-create.log');
+  fs.writeFileSync(createLog, '');
+  // The plan role's local artifact — present in cwd by the time reconcile runs.
+  stage.create(fx.dir, 'Worker owned work items', { type: 'feature' });
+  const PATH = `${bin}${path.delimiter}${process.env.PATH}`;
+  return { createLog, env: { PATH, GH_CREATE_LOG: createLog } };
+}
+
+test('agent-exec plan: --reconcile-work-items ON → worker creates the missing [stage N] issue (#176)', () => {
+  const fx = fixture();
+  canned(fx, MARKER_SUCCESS);
+  const { createLog, env } = planReconcileFixture(fx);
+
+  const { out, code } = run(fx, ['plan', '--run-id', 'r-wi-on', '--reconcile-work-items'], env);
+
+  assertEqual(code, 0, 'plan still succeeds');
+  const obj = parseSingleObject(out);
+  assertEqual(obj.outcome, 'success');
+  assert(obj.work_items, 'result carries a work_items reconciliation report');
+  assertEqual(JSON.stringify(obj.work_items.created), JSON.stringify([1]), 'stage 1 created');
+  const log = fs.readFileSync(createLog, 'utf8').trim();
+  assertEqual(log, '[stage 1] Worker owned work items', 'worker ran gh issue create for [stage 1]');
+});
+
+test('agent-exec plan: kill-switch OFF (no flag) → NO issue created, result has no work_items (byte-identical)', () => {
+  const fx = fixture();
+  canned(fx, MARKER_SUCCESS);
+  const { createLog, env } = planReconcileFixture(fx);
+
+  const { out, code } = run(fx, ['plan', '--run-id', 'r-wi-off'], env);
+
+  assertEqual(code, 0);
+  const obj = parseSingleObject(out);
+  assertEqual(obj.outcome, 'success');
+  assert(!('work_items' in obj), 'OFF must not add a work_items field');
+  assertEqual(
+    fs.readFileSync(createLog, 'utf8'),
+    '',
+    'OFF creates no issue — agent path unchanged',
+  );
+});
+
+// --- Stage 65 (#182/#176): reconcile also fires on a FAILED plan ---
+// The codex plan role self-reports `failed` (its `gh issue create` is denied
+// under containment), yet its stage files still merge back — so a success-only
+// gate skipped the very reconcile that exists for this case. The gate is now
+// {success, failed}; `gated`/`infra_error` remain excluded.
+const MARKER_FAILED_PLAN =
+  '{"verity":1,"outcome":"failed","gate":null,"artifacts":{},"reason":"gh issue create denied under containment"}';
+
+test('agent-exec plan: --reconcile-work-items ON + FAILED plan → worker STILL creates the missing [stage N] issue (#182)', () => {
+  // The regression: pre-stage-65 (gate === "success") this test fails — the
+  // reconcile never runs, no work_items attaches, and the create log is empty.
+  const fx = fixture();
+  canned(fx, MARKER_FAILED_PLAN);
+  const { createLog, env } = planReconcileFixture(fx);
+
+  const { out, code } = run(fx, ['plan', '--run-id', 'r-wi-failed', '--reconcile-work-items'], env);
+
+  assertEqual(code, 20, 'a failed plan still exits 20 — the outcome is unchanged');
+  const obj = parseSingleObject(out);
+  assertEqual(obj.outcome, 'failed');
+  assert(obj.work_items, 'a FAILED plan still carries a work_items reconciliation report');
+  assertEqual(
+    JSON.stringify(obj.work_items.created),
+    JSON.stringify([1]),
+    'stage 1 created despite the failed plan',
+  );
+  const log = fs.readFileSync(createLog, 'utf8').trim();
+  assertEqual(
+    log,
+    '[stage 1] Worker owned work items',
+    'worker ran gh issue create for [stage 1] even though the plan self-reported failed',
+  );
+});
+
+test('agent-exec: --reconcile-work-items ON + FAILED NON-plan role → no reconcile', () => {
+  const fx = fixture();
+  canned(fx, MARKER_FAILED_PLAN);
+  const { createLog, env } = planReconcileFixture(fx);
+
+  const { out, code } = run(
+    fx,
+    ['build', '7', '--run-id', 'r-wi-nonplan', '--reconcile-work-items'],
+    env,
+  );
+
+  assertEqual(code, 20);
+  const obj = parseSingleObject(out);
+  assertEqual(obj.outcome, 'failed');
+  assert(!('work_items' in obj), 'only the plan role reconciles — never a non-plan role');
+  assertEqual(fs.readFileSync(createLog, 'utf8'), '', 'no issue created for a non-plan role');
+});
+
+test('agent-exec plan: --reconcile-work-items ON + GATED plan → no reconcile (artifacts may not have merged)', () => {
+  const fx = fixture();
+  canned(
+    fx,
+    '{"verity":1,"outcome":"gated","gate":"plan:decision","artifacts":{},"reason":"awaiting a call"}',
+  );
+  const { createLog, env } = planReconcileFixture(fx);
+
+  const { out, code } = run(fx, ['plan', '--run-id', 'r-wi-gated', '--reconcile-work-items'], env);
+
+  assertEqual(code, 10, 'gated exits 10');
+  const obj = parseSingleObject(out);
+  assertEqual(obj.outcome, 'gated');
+  assert(!('work_items' in obj), 'a gated plan does not reconcile');
+  assertEqual(fs.readFileSync(createLog, 'utf8'), '', 'no issue created for a gated plan');
+});
+
+test('agent-exec plan: kill-switch OFF + FAILED plan → NO issue, no work_items (byte-identical)', () => {
+  const fx = fixture();
+  canned(fx, MARKER_FAILED_PLAN);
+  const { createLog, env } = planReconcileFixture(fx);
+
+  const { out, code } = run(fx, ['plan', '--run-id', 'r-wi-failed-off'], env);
+
+  assertEqual(code, 20);
+  const obj = parseSingleObject(out);
+  assertEqual(obj.outcome, 'failed');
+  assert(!('work_items' in obj), 'OFF must not add a work_items field, even on a failed plan');
+  assertEqual(fs.readFileSync(createLog, 'utf8'), '', 'OFF creates no issue on a failed plan');
 });

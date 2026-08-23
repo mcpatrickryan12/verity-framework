@@ -157,11 +157,15 @@
 // kill switch and for genuine breaker-READ failures.
 const agentExec = require('../bin/lib/agent-exec.cjs');
 const autonomy = require('../bin/lib/autonomy.cjs');
+const gates = require('../bin/lib/gates.cjs');
 const gh = require('../bin/lib/gh.cjs');
 const { LABELS } = require('../bin/lib/labels.cjs');
+const ledger = require('../bin/lib/ledger.cjs');
 const locks = require('../bin/lib/locks.cjs');
 const next = require('../bin/lib/next.cjs');
 const scanner = require('../bin/lib/scanner.cjs');
+const stage = require('../bin/lib/stage.cjs');
+const substrateLocal = require('../bin/lib/substrate-local.cjs');
 const trust = require('../bin/lib/trust.cjs');
 const usage = require('../bin/lib/usage.cjs');
 
@@ -179,6 +183,10 @@ const GATE_LABEL = labelName('verity:awaiting-approval');
 const APPROVED_LABEL = labelName('verity:approved');
 const NEEDS_HUMAN_LABEL = labelName('verity:needs-human');
 const CIRCUIT_LABEL = labelName('verity:circuit-open');
+// Stage 73 (#202): the P4 tier's plan trigger. The worker retires it from a
+// request issue after a successful plan produces stages, so later ticks fall to
+// P5 instead of re-anchoring P4 and re-planning an already-decomposed project.
+const REQUEST_LABEL = labelName('verity:request');
 
 // §7 "<outcome emoji+word>" vocabulary — one badge per SUMMARIZE outcome.
 const OUTCOME_BADGES = {
@@ -235,19 +243,35 @@ function makeRunId(now = Date.now()) {
 }
 
 // --- GitHub item ops (issue AND pr — both are issues to the REST API) -------
+//
+// Stage 80 (ADR-0029, contract local-work-item v1): each op dispatches on the
+// run's resolved substrate (ctx.substrate, stamped from policy.substrate in
+// runOnce). 'local' routes to the engine-performed record edits in
+// substrate-local.cjs (worker-owned commits, ADR-0026); anything else is the
+// gh path, byte-identical to before the seam existed. Live since stage 83:
+// assertSubstrateSupported now admits 'local' (the driver is complete).
 
 function apiBase(ctx, number) {
   return `repos/${ctx.repo}/issues/${number}`;
 }
 
 function addLabel(ctx, number, label) {
+  if (ctx.substrate === 'local') {
+    substrateLocal.addLabel(ctx.cwd, number, label);
+    return;
+  }
   gh.run(['api', '-X', 'POST', `${apiBase(ctx, number)}/labels`, '-f', `labels[]=${label}`], {
     cwd: ctx.cwd,
   });
 }
 
 // Tolerates already-absent labels (HTTP 404) so consume/cleanup is idempotent.
+// (The local op is idempotent on absence by construction — same end-state rule.)
 function removeLabel(ctx, number, label) {
+  if (ctx.substrate === 'local') {
+    substrateLocal.removeLabel(ctx.cwd, number, label);
+    return;
+  }
   try {
     gh.run(['api', '-X', 'DELETE', `${apiBase(ctx, number)}/labels/${encodeURIComponent(label)}`], {
       cwd: ctx.cwd,
@@ -259,7 +283,22 @@ function removeLabel(ctx, number, label) {
   }
 }
 
+// Stage 85 (ADR-0029; stage-83 review): substrate-aware like the label ops
+// above. Contract local-work-item v1 (FROZEN) has NO comment surface and must
+// not grow one — so on 'local' the comment body lands on the run's log stream
+// (ctx.stderr), headed with the record it addresses, and is NEVER silently
+// dropped. The STRUCTURED half of every §7 summary already lands in the usage
+// ledger (recordUsage → usage.csv — outcome, roles, tokens, cost, gate), which
+// the operator surface reads (`operator runs` / snapshot worker.last_*, stage
+// 85); this route carries the free text (findings bodies, gate instructions,
+// the summary template) the ledger's columns cannot. github: byte-identical.
 function postComment(ctx, number, body) {
+  if (ctx.substrate === 'local') {
+    ctx.stderr(
+      `verity-worker: local comment for work-item #${number} (contract local-work-item v1 has no comment surface — recorded on the run log, structured facts in the usage ledger; stage 85, ADR-0029):\n${body}`,
+    );
+    return;
+  }
   gh.run(['api', '-X', 'POST', `${apiBase(ctx, number)}/comments`, '-f', `body=${body}`], {
     cwd: ctx.cwd,
   });
@@ -464,16 +503,40 @@ function remainingTimeoutSecs(limits, elapsedMs) {
 // guarantee every codex run has had since stage 11. Tier 2 (disposable shaped
 // workspace + gated merge-back) is OPT-IN, and UNATTENDED codex autonomy is
 // refused without it (assertContainmentTier below).
+// Stage 54 (ADR-0024): the ONE resolution stays once-per-run and frozen — just
+// keyed by role. It returns a frozen resolver that exposes the BASE config (as
+// today, spread at the top level so every existing run-wide `.provider`/`.model`
+// read keeps working, plus a `.base` handle) AND `agentForRole(role)` = the base
+// overridden by `policy.agent.roles[role]`, per role. EVERY per-role config is
+// computed and frozen HERE, at run start; `agentForRole` is a pure lookup into
+// that frozen cache, so nothing re-reads (or can be made to re-read) policy
+// mid-run — the Stage-9 invariant is preserved, only now per-role instead of
+// single. Absent `agent.roles` ⇒ agentForRole returns the identical base for
+// every role ⇒ byte-identical to today (the feature's kill-switch, default OFF).
 function resolveEffectiveAgent(policy) {
-  return Object.freeze({
+  const agent = policy.agent || {};
+  const { roles: roleOverrides, ...agentBase } = agent;
+  const base = Object.freeze({
     provider: 'claude',
     model: null,
     sandbox: null,
     approval: null,
     acknowledged_enforcement_gaps: [],
     containment_tier: 1,
-    ...(policy.agent || {}),
+    reconcile_work_items: false,
+    ...agentBase,
   });
+  // Snapshot each role's fully-merged config, frozen, at resolution time. A
+  // shallow spread over the frozen base — the same discipline the base itself
+  // uses — so a later mutation of the policy object cannot reach these.
+  const cache = new Map();
+  if (roleOverrides !== null && typeof roleOverrides === 'object') {
+    for (const [role, override] of Object.entries(roleOverrides)) {
+      cache.set(role, Object.freeze({ ...base, ...(override || {}) }));
+    }
+  }
+  const agentForRole = (role) => cache.get(role) || base;
+  return Object.freeze({ ...base, base, agentForRole });
 }
 
 // ADR-0011 tier gating, checked at startup BEFORE any gh call, label, or lock.
@@ -483,16 +546,143 @@ function resolveEffectiveAgent(policy) {
 // impossible to propagate, so tier 1 is enough for supervised/trust-0 and not
 // enough for autonomy. Claude is unaffected: its write-time restriction is
 // enforced by its own harness allowlist, so it has no tiers.
-function assertContainmentTier(policy, agentCfg) {
-  if (policy.mode !== 'autonomous' || agentCfg.provider !== 'codex') {
+// Stage 54 (ADR-0024): the check is now PER ROLE, and strictly MORE fail-closed
+// — a per-role codex override can never bypass tier-2. The base config is
+// checked first (so a policy with NO roles map throws the byte-identical error
+// it always did), then every role whose RESOLVED provider is codex. `resolved`
+// is the resolveEffectiveAgent resolver: `.base` + `agentForRole`.
+function assertContainmentTier(policy, resolved) {
+  if (policy.mode !== 'autonomous') {
     return;
   }
-  if (agentCfg.containment_tier !== 2) {
+  const base = resolved.base;
+  if (base.provider === 'codex' && base.containment_tier !== 2) {
     throw new WorkerError(
-      `fail-closed: mode 'autonomous' with agent.provider codex requires ADR-0011 tier-2 containment (a disposable shaped workspace + gated merge-back), but agent.containment_tier is ${JSON.stringify(agentCfg.containment_tier)} — unattended codex autonomy is REFUSED at tier 1, which catches a protected-path write only after it happened. Set agent.containment_tier: 2 in .verity/autonomy.yml, or run in mode 'supervised'`,
+      `fail-closed: mode 'autonomous' with agent.provider codex requires ADR-0011 tier-2 containment (a disposable shaped workspace + gated merge-back), but agent.containment_tier is ${JSON.stringify(base.containment_tier)} — unattended codex autonomy is REFUSED at tier 1, which catches a protected-path write only after it happened. Set agent.containment_tier: 2 in .verity/autonomy.yml, or run in mode 'supervised'`,
       'containment-tier-required',
     );
   }
+  for (const role of autonomy.KNOWN_AGENT_ROLES) {
+    const cfg = resolved.agentForRole(role);
+    if (cfg.provider === 'codex' && cfg.containment_tier !== 2) {
+      throw new WorkerError(
+        `fail-closed: mode 'autonomous' with a per-role agent.provider codex (role '${role}') requires ADR-0011 tier-2 containment (a disposable shaped workspace + gated merge-back), but this role resolves to agent.containment_tier ${JSON.stringify(cfg.containment_tier)} — a per-role codex override can NEVER bypass tier-2. Set agent.roles.${role}.containment_tier: 2 (or agent.containment_tier: 2) in .verity/autonomy.yml, or run in mode 'supervised'`,
+        'containment-tier-required',
+      );
+    }
+  }
+}
+
+// Stage 79 (ADR-0029) introduced this delivery-substrate gate as a fail-closed
+// placeholder; stage 83 LIFTS it for 'local' — the local driver is complete
+// (stage 80 record store + snapshot acquirer, stage 81 bare-origin git
+// lifecycle + engine-performed merge, stage 82 gate runner), so 'github' AND
+// 'local' both proceed. Anything else still refuses fail-closed, checked at
+// startup BEFORE any gh call, scan, label, or lock — exactly like the tier
+// gate above. loadPolicy resolves `substrate` ONCE onto the effective policy
+// (absent ⇒ 'github', byte-identical; an unknown value is its own bad-policy
+// load error), so by the time a run consumes the policy the value is one of
+// the two schema enums — this check is the belt for unit callers passing raw
+// policy objects: a substrate this engine cannot drive must never proceed
+// half-driven, and never silently falls back to github (which would let a
+// config the operator believes is GitHub-free touch the real repo).
+function assertSubstrateSupported(policy) {
+  // Unit callers may pass a raw policy object; absence resolves to 'github',
+  // the same resolution loadPolicy performs.
+  const substrate = policy.substrate === undefined ? 'github' : policy.substrate;
+  if (substrate === 'github' || substrate === 'local') {
+    return;
+  }
+  throw new WorkerError(
+    `fail-closed: substrate '${substrate}' is not supported — the ADR-0029 delivery-substrate seam drives 'github' and 'local' (local driver complete as of stage 83); remove \`substrate: ${substrate}\` from .verity/autonomy.yml (absent resolves to github, byte-identical)`,
+    'substrate-unimplemented',
+  );
+}
+
+// Stage 76 guard, made substrate-aware by stage 81 (ADR-0029): did a build
+// role that self-reported `gated` actually FINISH its job, so the gate is a
+// mis-declared merge handoff? The stage-76 semantics key on the trust/role
+// outcome ("the builder's job ends at delivered-for-review"), not on a PR
+// object — but the original evidence guard was `artifacts.pr` (a real PR
+// number), which only the github substrate can produce. On 'local' there is
+// no PR to number; the equivalent delivered-for-review evidence is the
+// git-lifecycle report's `pushed: true` (Verity committed and pushed the
+// stage branch to the bare origin — agents/git-lifecycle.cjs finish, the
+// "branch pushed, PR not opened" path every gh-less role takes). The github
+// path is byte-identical: without `substrate === 'local'` the ONLY evidence
+// accepted is the original PR number, so a genuine no-PR build failure is
+// untouched exactly as before.
+// Stage 82 (ADR-0029 §4): the local substrate's verification act. Where the
+// github path waits on CI checks to appear on the pushed stage branch, the
+// local path has NO CI — so after a build role completes, the ENGINE runs the
+// committed single-source gate definition against that branch head and writes
+// the SHA-pinned gate-run record (contract local-work-item v1) the stage-80
+// snapshot driver reads. Synchronous by design: the record exists BEFORE the
+// loop re-consults the dependency engine, so the very next snapshot read turns
+// the branch's honest UNKNOWN into a verified green/red.
+//
+// Branch resolution: the Verity-performed git lifecycle names it directly
+// (codex, res.git_lifecycle.branch); a provider whose harness performs its own
+// git (claude) reports none, so the branch is DERIVED from the dispatch
+// decision's stage number via stage.branchName — the same derivation the
+// interactive `verity stage branch` uses, so it is the branch by construction.
+//
+// EVERY failure path is fail-closed and loud-but-non-fatal: a refused gate run
+// (no committed definition, dirty tree, mid-run head move, missing branch)
+// writes NO record, the branch stays UNKNOWN, and the existing ci:unverified
+// gate fires on the next decision — never green, and never a crashed worker
+// over a verification the snapshot honestly reports as unperformed.
+function runLocalGates(ctx, plan, res) {
+  let branch = typeof res.git_lifecycle?.branch === 'string' ? res.git_lifecycle.branch : null;
+  if (branch === null) {
+    const n = Number(plan.args?.[0]);
+    if (Number.isInteger(n)) {
+      try {
+        branch = stage.branchName(ctx.cwd, n);
+      } catch {
+        branch = null;
+      }
+    }
+  }
+  if (branch === null) {
+    ctx.stderr(
+      'verity-worker: warn: local build completed but no stage branch could be resolved for the gate run — the stage stays UNKNOWN (ci:unverified gates, ADR-0029 §4)',
+    );
+    return;
+  }
+  try {
+    // Stage 86 (ADR-0030): the run's resolved gate_runner travels with the
+    // call — 'localhost' executes via the stage-87 act runner and
+    // 'remote:<name>' via the stage-89 SSH act runner, both inside the same
+    // honesty bracket; a runner the engine cannot serve (an unreachable or
+    // unprovisionable remote, a localhost whose Docker/act preflight fails)
+    // refuses inside, landing in the catch below: no record, honestly
+    // UNKNOWN, loud warn — never a silent fallback to another runner.
+    const run = gates.runGatesForBranch(ctx.cwd, { branch, runner: ctx.gateRunner });
+    const verdict = run.ok
+      ? 'green'
+      : `red (${run.gates
+          .filter((g) => g.exit_code !== 0)
+          .map((g) => `${g.name}=${g.exit_code}`)
+          .join(', ')})`;
+    ctx.stderr(
+      `verity-worker: note: local gates for ${branch} @ ${run.sha.slice(0, 12)}: ${verdict} — record ${run.record} (stage 82, ADR-0029 §4)`,
+    );
+  } catch (err) {
+    ctx.stderr(
+      `verity-worker: warn: local gate run for ${branch} wrote no record — ${oneLine(err.message)}; the branch stays UNKNOWN and the ci:unverified gate fires (fail closed, ADR-0029 §4)`,
+    );
+  }
+}
+
+function buildMisdeclaredHandoff(res, substrate) {
+  if (res.outcome !== 'gated') {
+    return false;
+  }
+  if (Number.isInteger(res.artifacts?.pr)) {
+    return true;
+  }
+  return substrate === 'local' && res.git_lifecycle?.pushed === true;
 }
 
 function fmtTokens(n) {
@@ -580,15 +770,35 @@ const PARKED_POINTER_RE =
 // COMPLETED result's park ever calls this — the stage-25 failed-run park and
 // every pre-completion gate (ci:unverified, review:merge, role-declared)
 // record no pointer and keep their stages 19/21/22/25/27 semantics untouched.
+// Stage 85 (ADR-0029): the head read is substrate-aware — on 'local' the SHA
+// comes from the stage-80 snapshot's branch mapping + git itself
+// (substrateLocal.localPrHead), never `gh pr view`; a failed local read records
+// the same honest 'unknown' the gh path records (approval then repurchases,
+// never resumes a lie). github: byte-identical gh argv.
+function prHeadSha(ctx, pr) {
+  if (ctx.substrate === 'local') {
+    const head = substrateLocal.localPrHead(ctx.cwd, pr);
+    if (!/^[0-9a-f]{6,40}$/.test(head)) {
+      throw new Error(`local head for PR #${pr} is not a SHA: ${JSON.stringify(head)}`);
+    }
+    return head;
+  }
+  const view = gh.json(['pr', 'view', String(pr), '--json', 'headRefOid'], { cwd: ctx.cwd });
+  if (typeof view.headRefOid === 'string' && /^[0-9a-fA-F]{6,40}$/.test(view.headRefOid)) {
+    return view.headRefOid.toLowerCase();
+  }
+  return null;
+}
+
 function parkedResultPointer(ctx, { role, pr }) {
   if (!Number.isInteger(pr)) {
     return null;
   }
   let head = 'unknown';
   try {
-    const view = gh.json(['pr', 'view', String(pr), '--json', 'headRefOid'], { cwd: ctx.cwd });
-    if (typeof view.headRefOid === 'string' && /^[0-9a-fA-F]{6,40}$/.test(view.headRefOid)) {
-      head = view.headRefOid.toLowerCase();
+    const sha = prHeadSha(ctx, pr);
+    if (sha !== null) {
+      head = sha;
     }
   } catch (err) {
     ctx.stderr(
@@ -605,6 +815,18 @@ function parkedResultPointer(ctx, { role, pr }) {
 // cannot read yields null, and the approval buys a fresh dispatch instead of
 // wedging (the run-4 lesson: an approval must never be a no-op).
 function readParkedPointer(ctx, item) {
+  // Stage 85 (ADR-0029): the pointer LIVES in the gate-comment trail, and the
+  // local substrate has no comment surface (contract v1, frozen) — the local
+  // gate pause landed its text on the run log (postComment above), which is
+  // not a machine-readable trail. No pointer ⇒ the approval buys a fresh
+  // dispatch — the documented fail-safe direction (an approval is never a
+  // no-op, and a resume is never guessed). Said out loud, never silent.
+  if (ctx.substrate === 'local') {
+    ctx.stderr(
+      `verity-worker: note: no parked-result pointer can exist on the local substrate (no comment trail; contract local-work-item v1) — a consumed approval on #${item.number} dispatches fresh (stage 85, ADR-0029)`,
+    );
+    return null;
+  }
   try {
     const trail = locks.readComments(item, { repo: ctx.repo, cwd: ctx.cwd });
     for (let i = (trail || []).length - 1; i >= 0; i -= 1) {
@@ -641,10 +863,9 @@ function resumeParkedResult(ctx, { agentCfg, pointer }) {
   }
   let head = null;
   try {
-    const view = gh.json(['pr', 'view', String(pointer.pr), '--json', 'headRefOid'], {
-      cwd: ctx.cwd,
-    });
-    head = typeof view.headRefOid === 'string' ? view.headRefOid.toLowerCase() : null;
+    // Stage 85 (ADR-0029): substrate-aware head verification (prHeadSha above)
+    // — local reads git via the stage-80 snapshot; github is byte-identical.
+    head = prHeadSha(ctx, pointer.pr);
   } catch (err) {
     return refuse(
       `could not read PR #${pointer.pr}'s current head to verify the ${who} is still fresh (${oneLine(err.message)})`,
@@ -749,6 +970,61 @@ function startupChecks(ctx, policy) {
     ctx.stderr(`verity-worker: warn: ${daily.note}`);
   }
 
+  // Stage 85 (ADR-0029; stage-83 review): on the LOCAL substrate checks 2–4
+  // get honest local equivalents — never a fabricated pass, never a gh spawn:
+  //   2/3. preflight auth + bot identity: there is no GitHub to authenticate
+  //        against and no bot account to resolve. botLogin is NULL (the run's
+  //        honest marker — the ledger/summary already record the substrate via
+  //        the committed policy; a fabricated login is forbidden). Every
+  //        downstream consumer tolerates null: the scanner's P4 author filter
+  //        is skipped on a null botLogin by its own contract, and the
+  //        bot-is-human check has nothing to compare.
+  //   4.   circuit breaker: the label vocabulary is unchanged (contract
+  //        local-work-item v1 — labels are free strings), so the breaker reads
+  //        as "any OPEN work-item record carrying verity:circuit-open" — the
+  //        same derivation stage 84's operator snapshot uses for
+  //        autonomy.circuit_open, and the read `operator act circuit open`
+  //        now arms (stage 85). An unreadable store fails CLOSED (halt), the
+  //        gh path's own rule.
+  if (ctx.substrate === 'local') {
+    ctx.stderr(
+      'verity-worker: note: local substrate — no GitHub to authenticate against; preflight auth skipped and bot identity is null, never fabricated (stage 85, ADR-0029)',
+    );
+    let snap;
+    try {
+      snap = substrateLocal.fetchLocalSnapshot(ctx.cwd);
+    } catch (err) {
+      return {
+        ok: false,
+        slug: 'circuit-open',
+        message: `could not check the circuit breaker (failing closed): ${oneLine(err.message)}`,
+      };
+    }
+    if (snap.verified !== true) {
+      const detail = (snap.failures || [])
+        .map((f) => f.detail)
+        .filter(Boolean)
+        .join('; ');
+      return {
+        ok: false,
+        slug: 'circuit-open',
+        message: `could not check the circuit breaker (failing closed): the local record store could not be honestly read${detail ? ` — ${detail}` : ''}`,
+      };
+    }
+    const open = (snap.issues || []).filter(
+      (i) => i.state === 'OPEN' && (i.labels || []).includes(CIRCUIT_LABEL),
+    );
+    if (open.length > 0) {
+      const nums = open.map((i) => `#${i.number}`).join(', ');
+      return {
+        ok: false,
+        slug: 'circuit-open',
+        message: `circuit breaker is open: work-item record ${nums} carries label ${CIRCUIT_LABEL} — close it (\`verity operator act circuit close <n>\`) to resume autonomy`,
+      };
+    }
+    return { ok: true, botLogin: null, deferredDaily };
+  }
+
   // 2. `gh auth status` ok — any failure (not logged in, bad token, no gh) is fatal.
   try {
     gh.run(['auth', 'status'], { cwd: ctx.cwd });
@@ -844,6 +1120,15 @@ function priorRepeats(ctx, item, role) {
   if (!lockable(item)) {
     return 0;
   }
+  // Stage 85 (ADR-0029): the cross-tick trail is the §7 comment trail, which
+  // the local substrate does not carry (no comment surface, contract v1).
+  // 0 is the documented FLOOR ("we could not prove repetition" must not become
+  // "we refuse to work"): the within-run streak still bounds a single run and
+  // max_runs_per_day still bounds the day — the guard can only fire late,
+  // never early. Never a fabricated count.
+  if (ctx.substrate === 'local') {
+    return 0;
+  }
   try {
     return countRepeatedRole(locks.readComments(item, { repo: ctx.repo, cwd: ctx.cwd }), role);
   } catch (err) {
@@ -856,7 +1141,20 @@ function priorRepeats(ctx, item, role) {
 
 function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
   const t0 = monotonicMs(); // monotonic: elapsed never shrinks (ADR-0008)
-  const agentCfg = resolveEffectiveAgent(policy); // frozen — one config per run
+  // Stage 54 (ADR-0024): the frozen resolver — the base config (run-wide reads
+  // still use `agentCfg.provider`/`.model`) plus `agentForRole(role)` for the
+  // per-role dispatch below. Resolved ONCE here; nothing re-reads policy mid-run.
+  const agentCfg = resolveEffectiveAgent(policy);
+  const agentForRole = agentCfg.agentForRole;
+  // Stage 86 (ADR-0030): the resolved gate runner rides the run context like
+  // ctx.substrate — stamped ONCE from the frozen policy, consumed by
+  // runLocalGates below. 'localhost' executes via the stage-87 act runner
+  // and 'remote:<name>' via the stage-89 SSH act runner; any runner the
+  // engine cannot honestly serve (an unreachable/unprovisionable remote, an
+  // unprovisionable localhost) refuses at the gate call site rather than
+  // silently executing direct. Absent (unit callers passing raw
+  // pre-stage-86 policies) reads as the direct runner — byte-identical.
+  ctx.gateRunner = policy.gate_runner;
   const roles = [];
   // Stage 3 telemetry: one entry per agent-exec invocation (role, outcome,
   // tokens, est_usd, wall_secs, tool_calls) — SUMMARIZE writes one usage.csv
@@ -945,7 +1243,14 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
   // (derived from the same verified snapshot as the decision itself). Claude
   // dispatches never ask and never receive: its harness reads GitHub itself,
   // and agent-exec rejects the flag for it outright.
-  const wantsFacts = agentCfg.provider === 'codex';
+  // Stage 54 (ADR-0024): we don't know which role `verity next` will pick until
+  // it answers, so REQUEST facts whenever ANY role this run could dispatch as
+  // codex (the base, or a per-role override). Attaching them stays PER ROLE at
+  // dispatch (only a codex role's invocation gets --state-snapshot). With no
+  // roles map this reduces to `base.provider === 'codex'` — byte-identical.
+  const requestFacts =
+    agentCfg.provider === 'codex' ||
+    autonomy.KNOWN_AGENT_ROLES.some((r) => agentForRole(r).provider === 'codex');
 
   // No-progress strike state. The cross-tick count is read ONCE, from the
   // item's run-summary trail, on the run's first dispatch decision (it cannot
@@ -963,6 +1268,11 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
     result,
     roles,
     invocations,
+    // Stage 53: run-level provenance for the zero-invocation fallback row
+    // (entryFromSummary reads these). Worker-wide agentCfg; a null model writes
+    // '' at the usage layer, never a fabricated value.
+    provider: agentCfg.provider,
+    model: agentCfg.model,
     tokens,
     // Stage 30 (the third occurrence of the null-vs-zero class — ended here,
     // structurally): a run whose loop performed ZERO provider dispatches has a
@@ -997,6 +1307,15 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
     // role is `plan` on the request issue (the dependency engine knows stages,
     // not requests; planning is what turns the request INTO stages).
     let plan;
+    // Stage 73 (#202): the anti-thrash fix is RETIREMENT, not a stage-count
+    // guard here. A P4 selection means the scanner found an OPEN `verity:request`
+    // — and a request is only still labeled while it is UN-planned, because a
+    // successful plan retires the label below (so the P4 tier never re-selects
+    // it). Synthesizing `plan` unconditionally for a P4-first iteration is
+    // therefore correct: every P4-selected request genuinely needs planning.
+    // This is deliberately NOT keyed on `readStages().length === 0` — a global
+    // stage-count guard would block Mode B recurring intake (a NEW pending
+    // request must plan into new stages even when prior work's stages exist).
     if (first && item.tier === 'P4') {
       plan = {
         schema: 1,
@@ -1008,9 +1327,15 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
         reason: `request #${item.number} needs planning`,
       };
     } else {
-      plan = next.dispatch([], nextFlags, wantsFacts ? { withFacts: true } : {});
+      plan = next.dispatch([], nextFlags, requestFacts ? { withFacts: true } : {});
     }
     first = false;
+    // Stage 54 (ADR-0024): this iteration's role runs under ITS OWN resolved
+    // config — base overridden by agent.roles[plan.role]. A pure lookup into
+    // the frozen cache (no policy re-read). For idle/gated iterations plan.role
+    // may be absent; agentForRole then returns the base, and those paths return
+    // before it is used for dispatch/provenance anyway.
+    const roleCfg = agentForRole(plan.role);
     if (anchor === null && plan.target !== null && plan.target.kind !== 'stage') {
       anchor = plan.target.number;
     }
@@ -1066,7 +1391,7 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
       plan.target.kind === 'pr' &&
       plan.target.number === parkedPointer.pr
     ) {
-      const attempt = resumeParkedResult(ctx, { agentCfg, pointer: parkedPointer });
+      const attempt = resumeParkedResult(ctx, { agentCfg: roleCfg, pointer: parkedPointer });
       parkedPointer = null;
       if (attempt.res !== null) {
         res = attempt.res;
@@ -1131,44 +1456,61 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
         );
       }
 
-      // Every dispatch carries the run's immutable agent config: provider,
+      // Stage 54 (ADR-0024): each dispatch carries THIS ROLE's resolved config
+      // (roleCfg = base overridden by agent.roles[plan.role]) — provider,
       // optional model/sandbox/approval overrides (non-null only — omitted-in
       // keeps the claude path byte-identical), and the REMAINING wall-clock
-      // budget as a hard subprocess deadline (ADR-0008).
+      // budget as a hard subprocess deadline (ADR-0008). With no roles map
+      // roleCfg IS the base, so every flag below is byte-identical to today.
       const dispatchFlags = {
         cwd: ctx.cwd,
         'run-id': runId,
-        agent: agentCfg.provider,
+        agent: roleCfg.provider,
         'timeout-secs': remainingTimeoutSecs(policy.limits, monotonicMs() - t0),
       };
-      if (agentCfg.model !== null && agentCfg.model !== undefined) {
-        dispatchFlags.model = agentCfg.model;
+      if (roleCfg.model !== null && roleCfg.model !== undefined) {
+        dispatchFlags.model = roleCfg.model;
       }
-      if (agentCfg.sandbox !== null && agentCfg.sandbox !== undefined) {
-        dispatchFlags.sandbox = agentCfg.sandbox;
+      if (roleCfg.sandbox !== null && roleCfg.sandbox !== undefined) {
+        dispatchFlags.sandbox = roleCfg.sandbox;
       }
-      if (agentCfg.approval !== null && agentCfg.approval !== undefined) {
-        dispatchFlags.approval = agentCfg.approval;
+      if (roleCfg.approval !== null && roleCfg.approval !== undefined) {
+        dispatchFlags.approval = roleCfg.approval;
       }
       // ADR-0011: the operator's acknowledged enforcement gaps, omitted-in — an
       // empty/absent list never reaches agent-exec, so the claude path and every
       // pre-stage-11 policy dispatch byte-identically.
-      const acked = agentCfg.acknowledged_enforcement_gaps;
+      const acked = roleCfg.acknowledged_enforcement_gaps;
       if (Array.isArray(acked) && acked.length > 0) {
         dispatchFlags['acknowledge-gaps'] = acked.join(',');
       }
       // ADR-0011 tier 2, omitted-in the same way: only an explicit `2` travels,
       // so every pre-stage-14 policy dispatches byte-identically at tier 1.
-      if (agentCfg.containment_tier === 2) {
+      if (roleCfg.containment_tier === 2) {
         dispatchFlags['containment-tier'] = 2;
       }
-      // ADR-0013 (stage 24), omitted-in like every other codex-only knob: the
-      // Verity-read GitHub facts ride along ONLY for a contained dispatch that
-      // has them (the P4 first-iteration plan is synthesized without consulting
-      // the dependency engine, so it carries none). A claude dispatch never gets
-      // the flag even if a decision somehow carried facts — provider-checked, so
-      // the claude path stays byte-identical.
-      if (wantsFacts && plan.facts !== undefined) {
+      // ADR-0026 (stage 64): worker-owned work-item reconciliation, omitted-in like
+      // every other knob — only an explicit true travels, so pre-stage-63 policy
+      // dispatches byte-identically (no flag). agent-exec gates the flag to the plan role.
+      if (roleCfg.reconcile_work_items === true) {
+        dispatchFlags['reconcile-work-items'] = true;
+      }
+      // Stage 81 (ADR-0029): the resolved delivery substrate, omitted-in like
+      // every other knob — only 'local' travels (github/absent dispatches carry
+      // no flag, byte-identical), and agent-exec then narrows the role's
+      // capability projection: no github_read/github_write/network on the local
+      // substrate. Live since stage 83: assertSubstrateSupported admits
+      // 'local' (the driver completed across stages 80–82).
+      if (ctx.substrate === 'local') {
+        dispatchFlags.substrate = 'local';
+      }
+      // ADR-0013 (stage 24), omitted-in like every other codex-only knob, now
+      // PER ROLE (ADR-0024): the Verity-read GitHub facts ride along ONLY for a
+      // contained CODEX dispatch that has them (the P4 first-iteration plan is
+      // synthesized without consulting the dependency engine, so it carries
+      // none). A claude role never gets the flag even if a decision carried
+      // facts — provider-checked, so the claude path stays byte-identical.
+      if (roleCfg.provider === 'codex' && plan.facts !== undefined) {
         dispatchFlags['state-snapshot'] = plan.facts;
       }
       res = agentExec.dispatch([plan.role, ...plan.args], dispatchFlags);
@@ -1199,6 +1541,12 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
       est_usd: typeof res.est_usd === 'number' ? res.est_usd : null,
       wall_secs: res.wall_secs || 0,
       tool_calls: res.tool_calls || 0,
+      // Stage 53: provenance of the agent that produced this row. Stage 54
+      // (ADR-0024) makes it PER ROLE — this role's resolved provider/model
+      // (base overridden by agent.roles[plan.role]). A null model (the claude
+      // default) is written as '' by the usage writer.
+      provider: roleCfg.provider,
+      model: roleCfg.model,
     });
     tokens.in += res.tokens?.in || 0;
     tokens.out += res.tokens?.out || 0;
@@ -1238,6 +1586,30 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
     // stale prior iteration's PR, not this decision's), and review:merge already
     // does its own `pr ?? gateTarget`.
     const gateAnchor = gateTarget ?? lastPr;
+
+    // Stage 76: a builder's job ends at "PR open + CI green"; the review:merge gate
+    // belongs to the reviewer/worker trust ladder (T13), never the builder. A build
+    // role that self-reports `gated` (mis-declaring the merge gate it must hand OFF
+    // to) opened its PR and is DONE — coerce to the success handoff so the next tick
+    // dispatches review, instead of parking at a human gate that blocks review from
+    // EVER running (which wedges build-through under review.trust >= 1). Guarded on a
+    // real PR number so a genuine no-PR build failure is untouched. The unknown-cost
+    // gate is a SEPARATE post-completion checkpoint (stage 25/31), not this branch,
+    // so this never swallows a legitimate cost pause.
+    // Stage 81 (ADR-0029): the guard predicate is substrate-aware — on 'local'
+    // the delivered-for-review evidence is the pushed stage branch (no PR
+    // exists to number); github keeps the original real-PR-number guard,
+    // byte-identically (buildMisdeclaredHandoff above).
+    if (plan.role === 'build' && buildMisdeclaredHandoff(res, ctx.substrate)) {
+      const delivered = Number.isInteger(res.artifacts?.pr)
+        ? `PR #${res.artifacts.pr}`
+        : `pushed stage branch ${res.git_lifecycle?.branch}`;
+      ctx.stderr(
+        `verity-worker: note: build role mis-declared a merge gate — treating ${delivered} as a success handoff to review (T13: builders never own the merge gate)`,
+      );
+      res.outcome = 'success';
+      res.gate = null;
+    }
 
     if (res.outcome === 'gated') {
       const gate = gateNameFor(plan.role, policy);
@@ -1286,9 +1658,15 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
       }
       // 2-strike rule: prior strikes are `unlock:* outcome:failed*` comments on
       // the item (worker stays stateless); the current failure is strike +1.
-      const prior = lockable(item)
-        ? locks.countFailures(item, { repo: ctx.repo, cwd: ctx.cwd })
-        : 0;
+      // Stage 85 (ADR-0029): the unlock-comment trail has no local surface
+      // (contract v1 carries no comments), so prior strikes read the same
+      // honest FLOOR of 0 as priorRepeats — a local failure is strike 1 and
+      // retries next tick; the failed outcome itself is still recorded in the
+      // usage ledger and the run log. Never a fabricated count.
+      const prior =
+        lockable(item) && ctx.substrate !== 'local'
+          ? locks.countFailures(item, { repo: ctx.repo, cwd: ctx.cwd })
+          : 0;
       const strikes = prior + 1;
       if (strikes >= 2) {
         if (anchor !== null) {
@@ -1354,7 +1732,18 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
         typeof res.artifacts?.verdict === 'string' ? res.artifacts.verdict.toLowerCase() : null;
       const pr = Number.isInteger(res.artifacts?.pr) ? res.artifacts.pr : lastPr;
       const gate = gateNameFor('review', policy);
-      const ghOpts = { cwd: ctx.cwd };
+      // Stage 81 (ADR-0029 §3): the stage-79 substrate travels inside the same
+      // injectable ghOpts bag trust already takes — on 'local' checksGreen
+      // reads the stage-80 snapshot and trust.merge performs the engine's
+      // --no-ff merge; 'github' (and the undefined of a unit-built ctx) leaves
+      // every gh call byte-identical. Live since stage 83:
+      // assertSubstrateSupported admits 'local' (the driver is complete).
+      // Stage 84 (stage-81 review finding 2): the stamp is LOCAL-ONLY — a
+      // github run's ghOpts carries no substrate key, so the bag every gh call
+      // receives stays exactly what it was before ADR-0029 (no
+      // contract-adjacent pollution riding along on github substrates).
+      const ghOpts =
+        ctx.substrate === 'local' ? { cwd: ctx.cwd, substrate: 'local' } : { cwd: ctx.cwd };
       const trustLevel = policy.review.trust;
 
       let decision;
@@ -1413,6 +1802,32 @@ function runLoop(ctx, { policy, runId, item, budgetApproved = false }) {
         gate,
       );
     }
+    // Stage 73 (#202): retirement is the SOLE anti-thrash mechanism. A
+    // successful plan on a P4 request that produced stages retires the request's
+    // `verity:request` trigger, so the P4 scanner tier never re-selects the
+    // now-planned request (later ticks fall to P5, the dependency engine, and
+    // do the REAL next step). Because retirement is per-request, an un-planned
+    // request stays labeled and DOES plan, and a NEW request still plans even
+    // when prior work's stages exist (Mode B intake) — a stage-count guard on
+    // the synthesis above would have wrongly blocked that. Reaching here means
+    // res.outcome === 'success' (gated/failed/infra returned above), so
+    // retirement fires ONLY after a successful plan — a failed/limit_hit plan
+    // never gets here and can never strand an un-planned request with its
+    // trigger removed. Guarded on readStages > 0 (a plan that produced no stages
+    // keeps its label). Worker-side gh write (the contained plan role cannot
+    // relabel); idempotent via removeLabel's 404 tolerance.
+    if (plan.role === 'plan' && item.tier === 'P4' && ledger.readStages(ctx.cwd).length > 0) {
+      removeLabel(ctx, item.number, REQUEST_LABEL);
+    }
+    // Stage 82 (ADR-0029 §4): a completed LOCAL build gets its gates run HERE —
+    // engine-performed, synchronously, where the github path would wait on CI —
+    // so the re-consulted dependency engine below reads a verified green/red
+    // instead of UNKNOWN. Reaching this line means res.outcome === 'success'
+    // (gated/failed/infra returned above; the stage-76 handoff coercion has
+    // already applied). github/absent substrates never enter (byte-identical).
+    if (ctx.substrate === 'local' && plan.role === 'build') {
+      runLocalGates(ctx, plan, res);
+    }
     // success → chain: re-consult the dependency engine.
   }
 }
@@ -1469,6 +1884,42 @@ function summarize(ctx, policy, summary) {
 // carrier. Fail CLOSED — a list/read error yields no recovery, so the deferred
 // refusal fires byte-identically, exactly as before this fallback existed.
 function recheckApprovedCarrier(ctx) {
+  // Stage 85 (ADR-0029): on the LOCAL substrate the "fresh non-search read" IS
+  // the record store — committed files are strongly consistent, so the primary
+  // read and the settled-label enumeration are the same act: OPEN records
+  // carrying the awaiting gate, of which any also carrying `verity:approved`
+  // is a confirmed P1 carrier. Same FIFO pick, same fail-CLOSED direction (a
+  // store the engine cannot read yields no recovery and the deferred refusal
+  // fires unchanged). Zero gh spawns; github below is byte-identical.
+  if (ctx.substrate === 'local') {
+    try {
+      const approved = substrateLocal
+        .listWorkItems(ctx.cwd)
+        .filter(
+          (rec) =>
+            rec.state === 'OPEN' &&
+            rec.labels.includes(GATE_LABEL) &&
+            rec.labels.includes(APPROVED_LABEL),
+        )
+        .map((rec) =>
+          scanner.normalize(
+            { number: rec.number, title: rec.title, labels: rec.labels, createdAt: rec.created_at },
+            'issue',
+            'P1',
+          ),
+        );
+      if (approved.length === 0) {
+        return null;
+      }
+      approved.sort(scanner.byCreatedAt);
+      return approved[0];
+    } catch (err) {
+      ctx.stderr(
+        `verity-worker: warn: deferred-refusal re-check could not read the local record store (${oneLine(err.message)}) — refusing as usual`,
+      );
+      return null;
+    }
+  }
   const ghOpts = { cwd: ctx.cwd };
   const carriers = [];
   for (const kind of ['issue', 'pr']) {
@@ -1572,6 +2023,39 @@ function runOnce(ctx) {
     ctx.stdout(autonomy.WORKER_DISABLED_MESSAGE);
     return { exitCode: 0, outcome: 'disabled', result: autonomy.WORKER_DISABLED_MESSAGE };
   }
+  // Stage 80 (ADR-0029): stamp the resolved substrate on the run context so
+  // the item ops above dispatch without re-reading the policy. Stamped BEFORE
+  // the check below on purpose — the check is the flow control, the stamp is
+  // bookkeeping.
+  ctx.substrate = policy.substrate;
+  // Stage 85 (operator-smoke runs 4/5): export the run's FROZEN substrate to
+  // every child this run spawns — the GH_REPO export's exact pattern, one
+  // line below it in spirit. A dispatched role shells engine commands from a
+  // stage-branch checkout whose tree can PREDATE the substrate policy (the
+  // smoke's skew: stage branches fork off origin/<default>), and a cwd
+  // re-derivation there flipped `verity state`/`verity stage pr`/`verity
+  // operator snapshot` onto the github paths mid-local-run. The pin is the
+  // run's own resolution traveling with the run (substrate-local
+  // pinnedSubstrate honors ONLY the value 'local'); github runs export
+  // nothing — byte-identical.
+  // Stage 90: non-local runs also CLEAR an inherited pin. An operator shell
+  // that still carries VERITY_SUBSTRATE=local after a local run (or a wrapper
+  // script that exported it) would otherwise leak the stale pin to every
+  // child of a github run — and pinnedSubstrate honors it: the stage-85
+  // cwd-flip hazard in reverse. Deleting an absent var is a no-op, so a
+  // clean environment stays byte-identical.
+  if (ctx.substrate === 'local') {
+    process.env.VERITY_SUBSTRATE = 'local';
+  } else {
+    // biome-ignore lint/performance/noDelete: assigning undefined would set the env var to the string "undefined"
+    delete process.env.VERITY_SUBSTRATE;
+  }
+  // Stage 79 (ADR-0029): a policy selecting a substrate this engine cannot
+  // drive is refused ONCE, here at policy resolution — before any gh call,
+  // scan, label, or lock, exactly like the bad-policy refusal above and the
+  // tier gate below. Stage 83 lifted the refusal for 'local' (drivers landed
+  // in stages 80–82); unknown values still refuse fail-closed.
+  assertSubstrateSupported(policy);
   // ADR-0011: unattended codex autonomy is refused below tier 2 — before any
   // gh call, scan, label, or lock, exactly like the bad-policy refusal above.
   assertContainmentTier(policy, resolveEffectiveAgent(policy));
@@ -1599,7 +2083,18 @@ function runOnce(ctx) {
   let item = scanner.scan({
     cwd: ctx.cwd,
     botLogin: checks.botLogin,
-    isLocked: (it) => lockable(it) && locks.isFreshlyLocked(it, { repo: ctx.repo, cwd: ctx.cwd }),
+    // Stage 85 (ADR-0029): the resolved substrate rides into the scanner so
+    // its tier queries read the local record store instead of gh on 'local'
+    // (github: byte-identical queries). The lock predicate is likewise
+    // substrate-aware — the §4.3 lock protocol is a GitHub-comment protocol
+    // with NO local surface (contract v1 carries no comments), so on local
+    // nothing reads as locked and the run proceeds locklessly (announced at
+    // the acquire site below; single-operator store, sequential --once ticks).
+    substrate: ctx.substrate,
+    isLocked: (it) =>
+      lockable(it) &&
+      ctx.substrate !== 'local' &&
+      locks.isFreshlyLocked(it, { repo: ctx.repo, cwd: ctx.cwd }),
     warn: (msg) => {
       selfSkipNote = msg;
       ctx.stderr(`verity-worker: note: ${msg}`);
@@ -1681,6 +2176,11 @@ function runOnce(ctx) {
         result: `gated at ${p5Decision.gate} — ${p5Decision.reason}`,
         roles: [],
         invocations: [],
+        // Stage 53: record the run's configured provenance even on this
+        // zero-dispatch gate announcement — the run HAD an agent config; a null
+        // model writes '' at the usage layer, never a fabricated value.
+        provider: resolveEffectiveAgent(policy).provider,
+        model: resolveEffectiveAgent(policy).model,
         tokens: { in: 0, out: 0 },
         // A VERIFIED zero, not an unknown: this run dispatched no model, so
         // its cost is genuinely $0. Recording null here would serialize to an
@@ -1703,6 +2203,12 @@ function runOnce(ctx) {
     let why = 'no eligible work';
     if (p5Decision !== null && p5Decision.action === 'gated') {
       why = `no eligible work — gated at ${p5Decision.gate}: ${p5Decision.reason}`;
+    } else if (p5Decision !== null && p5Decision.status === next.WAITING_FOR_CI) {
+      // Stage 68 (ADR-0027): the ci:unverified gate is DEFERRED — the PR is
+      // fresh and CI is still registering. This is NOT "nothing to do" and NOT a
+      // gate: no label, no comment, no model run — the next tick re-reads the
+      // (by then registered) checks. Say so on stdout, exit 0.
+      why = p5Decision.reason;
     } else if (selfSkipNote !== null) {
       why = `no eligible work — ${selfSkipNote}`;
     }
@@ -1729,7 +2235,17 @@ function runOnce(ctx) {
   }
 
   let acquired = false;
-  if (lockable(item)) {
+  if (lockable(item) && ctx.substrate === 'local') {
+    // Stage 85 (ADR-0029): the §4.3 lock is a GitHub-comment protocol —
+    // contract local-work-item v1 (frozen) carries no comments, so there is no
+    // local lock surface to write. Proceed WITHOUT a lock, out loud (the same
+    // honest shape the non-lockable stage path takes): a single-operator local
+    // store runs `--once` ticks sequentially, and stage 84's operator snapshot
+    // reports worker.lock as honestly absent for the same reason.
+    ctx.stderr(
+      'verity-worker: note: local substrate has no lock surface (the §4.3 lock is a GitHub-comment protocol; contract local-work-item v1 carries no comments) — proceeding without a lock (stage 85, ADR-0029)',
+    );
+  } else if (lockable(item)) {
     const lock = locks.acquire(item, {
       runId,
       ttlMinutes: policy.limits.max_wall_clock_min, // ×1.5 headroom applied in locks
@@ -1795,7 +2311,10 @@ function main(argv) {
     if (opts.watch) {
       throw new WorkerError('--watch is not implemented yet (T17) — use --once', 'not-implemented');
     }
-    if (typeof opts.repo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(opts.repo)) {
+    // Stage 52 (#135): the shared slug check. The old inline
+    // /^[^/\s]+\/[^/\s]+$/ accepted 'acme/widget?' and 'acme/widget#', which
+    // `gh api` truncates — retargeting apiBase (index.cjs) and locks.cjs.
+    if (!gh.isRepoSlug(opts.repo)) {
       throw new WorkerError(`--repo owner/name is required — ${USAGE}`, 'usage');
     }
     if (!opts.once) {
@@ -1838,6 +2357,8 @@ module.exports = {
   USAGE,
   WorkerError,
   assertContainmentTier,
+  assertSubstrateSupported,
+  buildMisdeclaredHandoff,
   checkLimits,
   countRepeatedRole,
   formatFindingsComment,
@@ -1849,11 +2370,14 @@ module.exports = {
   makeRunId,
   parkedResultPointer,
   parseWorkerArgs,
+  prHeadSha,
   readParkedPointer,
+  recheckApprovedCarrier,
   recordUsage,
   resumeParkedResult,
   remainingTimeoutSecs,
   resolveEffectiveAgent,
+  runLocalGates,
   runLoop,
   summaryRoles,
   runOnce,

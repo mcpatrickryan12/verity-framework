@@ -223,6 +223,313 @@ test('a snapshot that carries no PR record is not "unverified CI"', () => {
 });
 
 // ---------------------------------------------------------------------------
+// (3a) Stage 68 (ADR-0027): the CI-registration recency guard
+//
+// A just-opened PR whose CI checks GitHub has not registered yet reads as an
+// empty rollup → CI_UNKNOWN, indistinguishable from a repo with no CI. The gate
+// is DEFERRED for a bounded grace after the PR was opened: within it the stage
+// reports `waiting_for_ci` (non-terminal — no gate, no human park) instead of
+// gating a healthy PR. `now` + the grace are injected via `opts` so the decision
+// is pure and deterministic. The green/red/unknown MODEL is untouched — the
+// guard only changes WHEN the gate fires, never advancing non-green to review.
+// ---------------------------------------------------------------------------
+
+// An unverified (empty-rollup) snapshot whose PR carries the registration
+// timestamp `createdAt` — what ledger.prRegisteredAt reads for the guard.
+function snapWithCreatedAt(createdAt) {
+  return {
+    issues: [{ number: 41, labels: [] }],
+    prs: [{ number: 114, labels: [], statusCheckRollup: [], createdAt }],
+  };
+}
+const NOW = Date.UTC(2026, 7, 11, 17, 7, 0); // a fixed injected clock
+
+test('recency guard: a JUST-OPENED PR with empty CI DEFERS the gate — waiting_for_ci, NOT gated', () => {
+  const createdAt = new Date(NOW - 10_000).toISOString(); // opened 10s ago
+  const d = nextLib.decide(unverifiedProj(), snapWithCreatedAt(createdAt), { now: NOW });
+  assert(d.action !== 'gated', `a fresh PR must not gate, got action=${d.action}`);
+  assertEqual(d.status, 'waiting_for_ci', 'it reports the CI-in-flight status');
+  assertEqual(d.gate, null, 'no gate object while waiting');
+  assertEqual(nextLib.exitCodeFor(d), 0, 'waiting is exit 0, never the gated exit 10');
+  assert(/registration grace/i.test(d.reason), `reason names the grace, got: ${d.reason}`);
+  // SAFETY (ADR-0027): waiting is NEVER a review/merge advance on non-green CI.
+  assert(d.role !== 'review', 'a waiting stage is NOT dispatched to review');
+  assertEqual(d.gate === 'review:merge', false, 'and never at the merge gate');
+  // The green MODEL is untouched — the empty rollup is still unknown, not green.
+  assertEqual(ledger.ciStateOf({ statusCheckRollup: [] }), 'unknown');
+});
+
+test('recency guard: a FUTURE-DATED just-opened PR (local clock behind GitHub) DEFERS — waiting_for_ci, NOT gated', () => {
+  // Stage 70: the box's clock is behind GitHub, so the just-opened PR's
+  // authoritative `createdAt` is a few seconds in the FUTURE vs the injected
+  // `now` → age is NEGATIVE (~-8s), well within MAX_CLOCK_SKEW_MS. This is the
+  // exact live repro (age = -7457ms). It must defer, not fail-closed into a gate.
+  const createdAt = new Date(NOW + 8_000).toISOString(); // 8s in the FUTURE → age = -8000
+  const d = nextLib.decide(unverifiedProj(), snapWithCreatedAt(createdAt), { now: NOW });
+  assert(d.action !== 'gated', `a future-dated fresh PR must not gate, got action=${d.action}`);
+  assertEqual(d.status, 'waiting_for_ci', 'clock-skew age is treated as just-opened');
+  assertEqual(d.gate, null, 'no gate object while waiting');
+  assertEqual(nextLib.exitCodeFor(d), 0, 'waiting is exit 0, never the gated exit 10');
+  assert(/registration grace/i.test(d.reason), `reason names the grace, got: ${d.reason}`);
+  // SAFETY (ADR-0027): a negative age never advances a non-green PR anywhere.
+  assert(d.role !== 'review', 'a waiting stage is NOT dispatched to review');
+  assertEqual(d.gate === 'review:merge', false, 'and never at the merge gate');
+});
+
+test('recency guard: an ABSURD-FUTURE timestamp (age <= -MAX_CLOCK_SKEW_MS) still gates — fail-closed on the absurd', () => {
+  // Stage 70: skew tolerance is BOUNDED. A createdAt implausibly far in the
+  // future (well beyond MAX_CLOCK_SKEW_MS) is not real clock skew — it gates.
+  const createdAt = new Date(NOW + 400_000).toISOString(); // age = -400_000 (> 300_000 skew)
+  const d = nextLib.decide(unverifiedProj(), snapWithCreatedAt(createdAt), { now: NOW });
+  assertEqual(d.action, 'gated', 'an absurd-future timestamp is not skew — it gates');
+  assertEqual(d.gate, 'ci:unverified');
+  // The bound is the exported constant, so this test tracks the real threshold.
+  assertEqual(nextLib.MAX_CLOCK_SKEW_MS, 300_000, 'the skew bound is 5 min');
+});
+
+test('recency guard: OLDER than the grace with still-empty CI gates ci:unverified exactly as before', () => {
+  const createdAt = new Date(NOW - 120_000).toISOString(); // opened 120s ago (> 90s grace)
+  const d = nextLib.decide(unverifiedProj(), snapWithCreatedAt(createdAt), { now: NOW });
+  assertEqual(d.action, 'gated', 'past the grace, empty CI is the genuine gate');
+  assertEqual(d.gate, 'ci:unverified');
+  assertEqual(JSON.stringify(d.target), '{"kind":"pr","number":114}', 'gate lands on the PR');
+});
+
+test('recency guard is FAIL-CLOSED: empty CI + NO timestamp gates as today, even with a clock', () => {
+  // An old/injected snapshot without createdAt must gate — "no timestamp" is
+  // never "recent" (treating it so would suppress a real no-CI gate).
+  const d = nextLib.decide(unverifiedProj(), unverifiedSnapshot(), { now: NOW });
+  assertEqual(d.action, 'gated', 'absent timestamp ⇒ gate');
+  assertEqual(d.gate, 'ci:unverified');
+});
+
+test('recency guard is INERT without a clock: a pure caller (no opts.now) gates as today', () => {
+  const createdAt = new Date(NOW - 10_000).toISOString();
+  const d = nextLib.decide(unverifiedProj(), snapWithCreatedAt(createdAt)); // no opts.now
+  assertEqual(
+    d.action,
+    'gated',
+    'no injected clock ⇒ no grace ⇒ gate (existing callers unchanged)',
+  );
+  assertEqual(d.gate, 'ci:unverified');
+});
+
+test('recency guard: the grace window is injectable via opts.ciGraceMs', () => {
+  const createdAt = new Date(NOW - 50_000).toISOString(); // 50s ago
+  // Default 90s ⇒ within grace ⇒ waiting.
+  assertEqual(
+    nextLib.decide(unverifiedProj(), snapWithCreatedAt(createdAt), { now: NOW }).status,
+    'waiting_for_ci',
+  );
+  // A tighter 30s grace ⇒ 50s is past it ⇒ gate.
+  const d = nextLib.decide(unverifiedProj(), snapWithCreatedAt(createdAt), {
+    now: NOW,
+    ciGraceMs: 30_000,
+  });
+  assertEqual(d.action, 'gated', 'a tighter injected grace makes the same PR gate');
+  assertEqual(d.gate, 'ci:unverified');
+});
+
+test('recency guard: GREEN CI within the window is review as always — the grace touches only the gate', () => {
+  const createdAt = new Date(NOW - 5_000).toISOString(); // just opened, but CI already green
+  const snap = {
+    issues: [{ number: 41, labels: [] }],
+    prs: [{ number: 114, labels: [], statusCheckRollup: [{ conclusion: 'SUCCESS' }], createdAt }],
+  };
+  const d = nextLib.decide(projWith('in-review', 114), snap, { now: NOW });
+  assertEqual(d.action, 'work');
+  assertEqual(d.role, 'review', 'green CI advances to review regardless of PR age');
+  assertEqual(d.status, undefined, 'a green PR is not waiting_for_ci');
+});
+
+test('recency guard: RED CI within the window still reads red (work/build), unchanged', () => {
+  const createdAt = new Date(NOW - 5_000).toISOString();
+  const snap = {
+    issues: [{ number: 41, labels: [] }],
+    prs: [{ number: 114, labels: [], statusCheckRollup: [{ conclusion: 'FAILURE' }], createdAt }],
+  };
+  const d = nextLib.decide(projWith('building', 114), snap, { now: NOW });
+  assertEqual(d.action, 'work');
+  assertEqual(d.role, 'build', 'red CI is not deferred — only the empty/unknown case is');
+  assertEqual(d.status, undefined);
+});
+
+test('recency guard: a waiting stage does NOT starve a later workable stage', () => {
+  // stage 1 fresh+empty (deferred), stage 2 green+in-review (workable). decide()
+  // must skip the waiting head and return the workable stage — the same
+  // "drop the waiting item, pick from the rest" rule an announced gate uses.
+  const proj = {
+    stages: [
+      {
+        number: 1,
+        title: 'A',
+        type: 'feature',
+        dependsOn: [],
+        status: 'building',
+        issue: 41,
+        pr: 114,
+      },
+      {
+        number: 2,
+        title: 'B',
+        type: 'feature',
+        dependsOn: [],
+        status: 'in-review',
+        issue: 42,
+        pr: 115,
+      },
+    ],
+    next: [1, 2],
+  };
+  const createdAt = new Date(NOW - 5_000).toISOString();
+  const snap = {
+    issues: [
+      { number: 41, labels: [] },
+      { number: 42, labels: [] },
+    ],
+    prs: [
+      { number: 114, labels: [], statusCheckRollup: [], createdAt },
+      { number: 115, labels: [], statusCheckRollup: [{ conclusion: 'SUCCESS' }] },
+    ],
+  };
+  const d = nextLib.decide(proj, snap, { now: NOW });
+  assertEqual(d.action, 'work', 'the workable stage is chosen over the waiting one');
+  assertEqual(
+    JSON.stringify(d.target),
+    '{"kind":"pr","number":115}',
+    'stage 2 (green) wins the tick — the waiting stage 1 did not block it',
+  );
+});
+
+test('SAFETY (ADR-0027): NO recency-guard path advances a non-green PR to review or merge', () => {
+  const fresh = new Date(NOW - 5_000).toISOString();
+  const futureDated = new Date(NOW + 8_000).toISOString(); // Stage 70: clock-skew defer
+  const absurdFuture = new Date(NOW + 400_000).toISOString(); // Stage 70: absurd → gate
+  const old = new Date(NOW - 120_000).toISOString();
+  const redFresh = {
+    issues: [{ number: 41, labels: [] }],
+    prs: [
+      { number: 114, labels: [], statusCheckRollup: [{ conclusion: 'FAILURE' }], createdAt: fresh },
+    ],
+  };
+  const cases = [
+    ['fresh empty (deferred)', snapWithCreatedAt(fresh)],
+    ['future-dated empty / clock skew (deferred)', snapWithCreatedAt(futureDated)],
+    ['absurd-future empty (gated)', snapWithCreatedAt(absurdFuture)],
+    ['old empty (gated)', snapWithCreatedAt(old)],
+    ['empty, no timestamp (gated)', unverifiedSnapshot()],
+    ['fresh red', redFresh],
+  ];
+  for (const [name, snap] of cases) {
+    const d = nextLib.decide(unverifiedProj(), snap, { now: NOW });
+    assert(d.gate !== 'review:merge', `${name}: never lands at the merge gate`);
+    assert(
+      !(d.action === 'work' && d.role === 'review'),
+      `${name}: a non-green PR is never dispatched to review`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// (3c) Stage 77: serialize build-through under auto-merge (review trust >= 1)
+//
+// A FRESH build for a LATER stage must not open a second concurrent PR while an
+// earlier stage is still in flight — that stage would fork off a base missing
+// its predecessor. Under review trust >= 1 decide() holds the fresh build back
+// and returns the in-flight (waiting) stage. At trust 0 / undefined behaviour is
+// BYTE-IDENTICAL (the run gates after one stage anyway). The trust is INJECTED
+// via `opts.reviewTrust` so decide() stays pure. A re-build of an existing PR is
+// never suppressed.
+// ---------------------------------------------------------------------------
+
+// Stage 1: a just-opened PR with empty CI → waiting_for_ci (in flight). Stage 2:
+// planned, no PR → a fresh build (its work-item issue makes target.kind 'issue').
+function serializeProj() {
+  return {
+    stages: [
+      {
+        number: 1,
+        title: 'A',
+        type: 'feature',
+        dependsOn: [],
+        status: 'building',
+        issue: 41,
+        pr: 114,
+      },
+      {
+        number: 2,
+        title: 'B',
+        type: 'feature',
+        dependsOn: [1],
+        status: 'planned',
+        issue: 42,
+        pr: null,
+      },
+    ],
+    next: [1, 2],
+  };
+}
+function serializeSnap() {
+  const createdAt = new Date(NOW - 5_000).toISOString(); // stage 1 PR just opened
+  return {
+    issues: [
+      { number: 41, labels: [] },
+      { number: 42, labels: [] },
+    ],
+    prs: [{ number: 114, labels: [], statusCheckRollup: [], createdAt }],
+  };
+}
+
+test('serialize (stage 77): trust >= 1 holds a fresh stage-2 build behind the in-flight stage 1', () => {
+  const d = nextLib.decide(serializeProj(), serializeSnap(), { now: NOW, reviewTrust: 2 });
+  assertEqual(d.status, 'waiting_for_ci', 'the in-flight stage 1 is returned, not a stage-2 build');
+  assertEqual(
+    JSON.stringify(d.target),
+    '{"kind":"pr","number":114}',
+    'and it is stage 1 (PR #114) that is waited on',
+  );
+  assert(
+    JSON.stringify(d.args) !== '["2"]',
+    'no second concurrent PR is opened for stage 2 while stage 1 is in flight',
+  );
+});
+
+test('serialize (stage 77): trust 0 / undefined is BYTE-IDENTICAL — the stage-2 build is returned', () => {
+  for (const reviewTrust of [undefined, 0]) {
+    const d = nextLib.decide(serializeProj(), serializeSnap(), { now: NOW, reviewTrust });
+    assertEqual(d.action, 'work', `trust ${JSON.stringify(reviewTrust)}: stage 2 still builds`);
+    assertEqual(d.role, 'build');
+    assertEqual(JSON.stringify(d.args), '["2"]', 'the later stage is NOT held back below trust 1');
+    assertEqual(d.target.kind, 'issue', 'a fresh stage carries its work-item issue as the target');
+  }
+});
+
+test('serialize (stage 77): a re-build of an EXISTING PR (target.kind pr) is never suppressed', () => {
+  // Stage 1 in flight (waiting_for_ci); stage 2 already has its own PR with red
+  // CI — a re-build, not a fresh PR — so it must still be returned at trust >= 1.
+  const proj = serializeProj();
+  proj.stages[1] = {
+    number: 2,
+    title: 'B',
+    type: 'feature',
+    dependsOn: [1],
+    status: 'building',
+    issue: 42,
+    pr: 115,
+  };
+  const snap = serializeSnap();
+  snap.prs.push({ number: 115, labels: [], statusCheckRollup: [{ conclusion: 'FAILURE' }] });
+  const d = nextLib.decide(proj, snap, { now: NOW, reviewTrust: 2 });
+  assertEqual(d.action, 'work');
+  assertEqual(d.role, 'build');
+  assertEqual(
+    JSON.stringify(d.target),
+    '{"kind":"pr","number":115}',
+    'the re-build advances the in-flight PR — only a brand-new second PR is held back',
+  );
+});
+
+// ---------------------------------------------------------------------------
 // (3b) The policy knob is ADDITIVE and DEFAULT-ABSENT
 // (same shape as agent.acknowledged_enforcement_gaps / agent.containment_tier)
 // ---------------------------------------------------------------------------

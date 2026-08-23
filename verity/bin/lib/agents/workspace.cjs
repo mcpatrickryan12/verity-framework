@@ -105,7 +105,7 @@ function inside(root, rel) {
 // boundary at all, and Codex additionally refuses to create helper binaries
 // under a temporary dir). agent-exec sites it beside the run's transcripts,
 // under the Verity state root.
-function prepare({ cwd, dir, policy, protectedPaths = [], keep = false }) {
+function prepare({ cwd, dir, policy, protectedPaths = [], readContextPaths = [], keep = false }) {
   if (!git(cwd, ['rev-parse', '--git-dir']).ok) {
     throw unavailable(`${cwd} is not a git repository`);
   }
@@ -114,10 +114,22 @@ function prepare({ cwd, dir, policy, protectedPaths = [], keep = false }) {
   }
   const caps = policy.capabilities || {};
   const allowProtected = caps.write_protected_paths === true;
-  // The roots WITHHELD from the workspace: the protected roots, unless the
-  // role's policy grants writes to them. Shaping is derived from policy — it
-  // is never a hardcoded list of what "feels" dangerous.
-  const withheld = allowProtected ? [] : protectedPaths.map(rootName);
+  // TWO DECOUPLED CONCEPTS (issue #171). `protectedRoots` is the FULL set the
+  // gate rejects writes to — "the teeth", the ADR-0011 invariant layer.
+  // `withheld` is the TOPOLOGICAL shaping: the subset physically ABSENT from
+  // the workspace. They were the same list until a required READ context that
+  // is ALSO a protected write root (`.verity/identity.json`, which the plan
+  // role's `verity identity get` reads) forced them apart: absenting it made
+  // `identity get` fail and Codex helpfully RECREATE `.verity/identity.json`,
+  // which the gate then rejected — the whole run lost to a self-inflicted
+  // write. A read-context root is therefore PRESENT (readable) but still in
+  // `protectedRoots`, so a genuine write to it shows in `git status` and is
+  // still rejected by the gate. Enforcement moves from the topological layer
+  // to the gate, which ADR-0011 designates the invariant layer. Both derive
+  // from policy — `write_protected_paths` still withholds/protects nothing.
+  const protectedRoots = allowProtected ? [] : protectedPaths.map(rootName);
+  const readContext = allowProtected ? [] : readContextPaths.map(rootName);
+  const withheld = protectedRoots.filter((r) => !readContext.includes(r));
 
   fs.mkdirSync(path.dirname(dir), { recursive: true });
   fs.rmSync(dir, { recursive: true, force: true }); // a stale dir would fail the add
@@ -129,7 +141,7 @@ function prepare({ cwd, dir, policy, protectedPaths = [], keep = false }) {
     path: dir,
     root: cwd,
     withheld,
-    protectedRoots: withheld,
+    protectedRoots,
     allowProtected,
     // The role's declared writable set, provider-neutrally: a role without
     // write_repository may propagate NOTHING (contracts/role-capability-policy

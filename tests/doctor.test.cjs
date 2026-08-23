@@ -705,3 +705,333 @@ test('doctor: --quiet --agent codex stays exit-code-only (stdout empty)', () => 
   assertEqual(bad.code, 1);
   assertEqual(bad.out, '', 'nothing on stdout even when failing');
 });
+
+// --- stage 87 (ADR-0030): localhost gate-runner probe rows --------------------
+// A project whose RESOLVED gate_runner is 'localhost' gets two extra rows —
+// docker (present + daemon reachable via `docker info`) and act (present +
+// version) — on the stage-85 substrate-aware pattern: the resolved policy
+// value travels into runChecks, and any OTHER resolved runner (including the
+// absent-key native resolution) adds NOTHING, so unconfigured projects stay
+// byte-identical. Binaries honor VERITY_DOCKER_BIN / VERITY_ACT_BIN.
+
+const DOCKER_OK = `case "$1" in
+  --version) echo "Docker version 27.0.1, build abc123";;
+  info) echo "Server: docker ok";;
+esac
+exit 0`;
+const DOCKER_NO_DAEMON = `case "$1" in
+  --version) echo "Docker version 27.0.1, build abc123"; exit 0;;
+  info) echo "Cannot connect to the Docker daemon" >&2; exit 1;;
+esac
+exit 0`;
+const ACT_OK = 'echo "act version 0.2.89"';
+
+function localhostProject(policy = 'substrate: local\ngate_runner: localhost\n') {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'verity-doctor-gaterunner-'));
+  fs.mkdirSync(path.join(project, '.verity'), { recursive: true });
+  fs.writeFileSync(path.join(project, '.verity', 'autonomy.yml'), policy);
+  return project;
+}
+
+test('doctor stage 87: resolved gate_runner localhost adds docker + act rows — both green shapes', () => {
+  const fx = fixture();
+  healthy(fx);
+  fx.stub('docker', DOCKER_OK);
+  fx.stub('act', ACT_OK);
+  const { out, code } = run(fx, ['--cwd', localhostProject()]);
+  assertEqual(code, 0, 'a provisioned localhost machine is green');
+  const { byName } = rowsByName(out);
+  assert(byName.docker !== undefined, 'docker row present');
+  assertEqual(byName.docker.present, true);
+  assertEqual(byName.docker.ok, true);
+  assert(byName.docker.detail.includes('`docker info` ok'), 'daemon reachability probed');
+  assert(byName.act !== undefined, 'act row present');
+  assertEqual(byName.act.ok, true);
+  assertEqual(byName.act.version, '0.2.89', 'act version parsed');
+  // The local substrate's gh skip row is untouched by the new rows.
+  assertEqual(byName.gh.ok, true);
+  assert(/skipped on the local substrate/.test(byName.gh.detail), byName.gh.detail);
+});
+
+test('doctor stage 87: NO new rows unless the RESOLVED gate_runner is localhost (kill-switch by design)', () => {
+  const fx = fixture();
+  healthy(fx);
+  // substrate local with NO gate_runner key resolves 'direct' — no rows.
+  const direct = run(fx, ['--cwd', localhostProject('substrate: local\n')]);
+  assertEqual(direct.code, 0);
+  let byName = rowsByName(direct.out).byName;
+  assert(byName.docker === undefined && byName.act === undefined, 'direct adds nothing');
+  // No policy file at all (the github default) — byte-identical stage-1 rows.
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'verity-doctor-noconf-'));
+  const none = run(fx, ['--cwd', project]);
+  assertEqual(none.code, 0);
+  const rows = rowsByName(none.out);
+  byName = rows.byName;
+  assert(byName.docker === undefined && byName.act === undefined, 'unconfigured adds nothing');
+  assertEqual(rows.checks.length, 4, 'the untouched stage-1 registry');
+});
+
+test('doctor stage 87: daemon-down and act-absent fail shapes — each row says why, exit 1', () => {
+  const fx = fixture();
+  healthy(fx);
+  fx.stub('docker', DOCKER_NO_DAEMON); // no act stub on PATH at all
+  const { out, code } = run(fx, ['--cwd', localhostProject()]);
+  assertEqual(code, 1, 'a failing probe row fails doctor');
+  const { byName } = rowsByName(out);
+  assertEqual(byName.docker.present, true, 'the binary itself runs');
+  assertEqual(byName.docker.ok, false, 'but the daemon probe failed the row');
+  assert(byName.docker.detail.includes('`docker info` failed'), byName.docker.detail);
+  assertEqual(byName.act.present, false);
+  assertEqual(byName.act.ok, false);
+  assert(byName.act.detail.includes('act not runnable'), byName.act.detail);
+});
+
+test('doctor stage 87: VERITY_DOCKER_BIN / VERITY_ACT_BIN overrides pick the probed executables', () => {
+  const fx = fixture();
+  healthy(fx);
+  // Nothing named docker/act on PATH; the overrides point at off-PATH stubs.
+  const alt = fs.mkdtempSync(path.join(os.tmpdir(), 'verity-doctor-altbin-'));
+  const write = (name, body) => {
+    const file = path.join(alt, name);
+    fs.writeFileSync(file, `#!/bin/sh\n${body}\n`);
+    fs.chmodSync(file, 0o755);
+    return file;
+  };
+  const dockerBin = write('my-docker', DOCKER_OK);
+  const actBin = write('my-act', 'echo "act version 0.3.0"');
+  const { out, code } = run(fx, ['--cwd', localhostProject()], {
+    VERITY_DOCKER_BIN: dockerBin,
+    VERITY_ACT_BIN: actBin,
+  });
+  assertEqual(code, 0, 'overridden binaries probed green');
+  const { byName } = rowsByName(out);
+  assertEqual(byName.docker.ok, true);
+  assertEqual(byName.act.ok, true);
+  assertEqual(byName.act.version, '0.3.0', 'the override was the probed act');
+});
+
+// --- stage 88 (ADR-0030): remote:<name> gate-runner probe rows ----------------
+// A project whose RESOLVED gate_runner is `remote:<name>` gets four extra
+// rows — gate-runner-catalog (the name resolves against
+// ~/.verity/gate-runners.md), ssh (BatchMode reachability), remote-docker,
+// remote-act — each gated on the one before it (an unresolved name or a dead
+// SSH channel reads "not probed", never a fabricated verdict). Probes run
+// over the operator's existing SSH context via a stubbed `ssh`
+// (VERITY_SSH_BIN / fixture PATH — no real network); credential material from
+// the catalog never appears in any output. Any other resolved runner adds
+// nothing (the stage-87 tests above pin localhost + unconfigured shapes).
+
+const SSH_OK = `if [ "$1" != "-o" ] || [ "$2" != "BatchMode=yes" ]; then echo "not batch" >&2; exit 9; fi
+shift 3
+case "$1" in
+  true) exit 0;;
+  docker) echo "remote docker info"; exit 0;;
+  act) echo "act version 0.2.89"; exit 0;;
+esac
+exit 1`;
+const SSH_DOWN = 'echo "Permission denied (publickey)." >&2\nexit 255';
+const SSH_REMOTE_BROKEN = `shift 3
+case "$1" in
+  true) exit 0;;
+  docker) echo "Cannot connect to the Docker daemon" >&2; exit 1;;
+  act) echo "bash: act: command not found" >&2; exit 127;;
+esac
+exit 1`;
+const SSH_ACT_UNPARSEABLE = `shift 3
+case "$1" in
+  true) exit 0;;
+  docker) exit 0;;
+  act) echo "act dev build"; exit 0;;
+esac
+exit 1`;
+
+const REMOTE_CATALOG = `## gpu-box — GPU box
+- **status:** active
+- **host:** gpu.lan
+- **user:** ci
+- **access:** key at ~/.ssh/secret-key.pem (location only)
+`;
+
+// The child's global catalog lives in a fixture-scoped VERITY_HOME — never
+// the developer's real ~/.verity, and immune to an ambient VERITY_HOME.
+function remoteFixture(fx, { catalog = REMOTE_CATALOG, name = 'gpu-box' } = {}) {
+  const verityHome = path.join(fx.home, '.verity');
+  fs.mkdirSync(verityHome, { recursive: true });
+  fs.writeFileSync(path.join(verityHome, 'gate-runners.md'), catalog);
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'verity-doctor-remote-'));
+  fs.mkdirSync(path.join(project, '.verity'), { recursive: true });
+  fs.writeFileSync(
+    path.join(project, '.verity', 'autonomy.yml'),
+    `substrate: local\ngate_runner: remote:${name}\n`,
+  );
+  return { project, verityHome, env: { VERITY_HOME: verityHome } };
+}
+
+test('doctor stage 88: resolved remote:<name> adds catalog + ssh + remote-docker + remote-act rows — all green, no credential material', () => {
+  const fx = fixture();
+  healthy(fx);
+  fx.stub('ssh', SSH_OK);
+  const { project, verityHome, env } = remoteFixture(fx);
+  const { out, code } = run(fx, ['--cwd', project], env);
+  assertEqual(code, 0, 'a resolvable, reachable, provisioned remote is green');
+  const { byName } = rowsByName(out);
+  const catalogRow = byName['gate-runner-catalog'];
+  assert(catalogRow !== undefined, 'catalog row present');
+  assertEqual(catalogRow.ok, true);
+  assertEqual(
+    catalogRow.detail,
+    `entry 'gpu-box' resolves to ci@gpu.lan (${path.join(verityHome, 'gate-runners.md')})`,
+    'names the entry, the target, and the catalog path — nothing else',
+  );
+  assertEqual(byName.ssh.ok, true);
+  assert(byName.ssh.detail.includes('-o BatchMode=yes ci@gpu.lan true'), byName.ssh.detail);
+  assertEqual(byName['remote-docker'].ok, true);
+  assert(byName['remote-docker'].detail.includes('remote `docker info` ok on ci@gpu.lan'));
+  assertEqual(byName['remote-act'].ok, true);
+  assertEqual(byName['remote-act'].version, '0.2.89', 'remote act version parsed');
+  // The remote rows are distinct from the localhost rows (the local machine
+  // needs neither binary), and the local-substrate gh skip row is untouched.
+  assert(byName.docker === undefined && byName.act === undefined, 'no localhost rows');
+  assert(/skipped on the local substrate/.test(byName.gh.detail), byName.gh.detail);
+  // Credential LOCATIONS from the operator's catalog never enter doctor
+  // output — only the entry name, target, and catalog path do.
+  assert(!out.includes('secret-key'), 'no credential material anywhere in the report');
+});
+
+test('doctor stage 88: remote rows appear ONLY for a resolved remote:<name> runner (kill-switch by design)', () => {
+  const fx = fixture();
+  healthy(fx);
+  fx.stub('docker', DOCKER_OK);
+  fx.stub('act', ACT_OK);
+  // localhost keeps its stage-87 rows and gains none of the remote rows.
+  const local = run(fx, ['--cwd', localhostProject()]);
+  const localRows = rowsByName(local.out).byName;
+  assert(localRows['gate-runner-catalog'] === undefined, 'no catalog row for localhost');
+  assert(localRows.ssh === undefined, 'no ssh row for localhost');
+  assert(localRows.docker !== undefined && localRows.act !== undefined, 'stage-87 rows intact');
+  // An unconfigured project (no policy) adds nothing at all.
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'verity-doctor-noremote-'));
+  const none = run(fx, ['--cwd', project]);
+  const noneRows = rowsByName(none.out).byName;
+  assert(
+    noneRows['gate-runner-catalog'] === undefined && noneRows.ssh === undefined,
+    'unconfigured adds no remote rows',
+  );
+});
+
+test('doctor stage 90: an option-shaped catalog host fails the catalog row with the resolver refusal; SSH probes read "not probed" — exit 1', () => {
+  // The stage-90 resolveRemote refusal (a host/user beginning with '-' would
+  // be parsed by OpenSSH as an option, not a hostname) surfaces through the
+  // EXISTING stage-88 plumbing: the gate-runner-catalog row's failure detail
+  // IS the resolver's message, and the gated probes never spawn ssh with the
+  // option-shaped target.
+  const fx = fixture();
+  healthy(fx);
+  fx.stub('ssh', SSH_OK);
+  const { project, env } = remoteFixture(fx, {
+    catalog: '## gpu-box — GPU box\n- **status:** active\n- **host:** -oProxyCommand=evil\n',
+  });
+  const { out, code } = run(fx, ['--cwd', project], env);
+  assertEqual(code, 1, 'an option-shaped target fails doctor');
+  const { byName } = rowsByName(out);
+  assertEqual(byName['gate-runner-catalog'].ok, false);
+  assert(
+    byName['gate-runner-catalog'].detail.includes(
+      "has '- **host:** -oProxyCommand=evil' beginning with '-'",
+    ),
+    byName['gate-runner-catalog'].detail,
+  );
+  for (const name of ['ssh', 'remote-docker', 'remote-act']) {
+    assertEqual(byName[name].ok, false, `${name} cannot pass without a resolved target`);
+    assertEqual(byName[name].present, null, `${name} was not observed`);
+    assert(byName[name].detail.startsWith('not probed:'), byName[name].detail);
+  }
+});
+
+test('doctor stage 88: an unresolvable name fails the catalog row with the known entries; the SSH probes read "not probed" — exit 1', () => {
+  const fx = fixture();
+  healthy(fx);
+  fx.stub('ssh', SSH_OK);
+  const { project, env } = remoteFixture(fx, { name: 'gpu-boxx' }); // catalog knows gpu-box
+  const { out, code } = run(fx, ['--cwd', project], env);
+  assertEqual(code, 1, 'an unresolvable runner fails doctor');
+  const { byName } = rowsByName(out);
+  assertEqual(byName['gate-runner-catalog'].ok, false);
+  assert(
+    byName['gate-runner-catalog'].detail.includes("no entry named 'gpu-boxx'") &&
+      byName['gate-runner-catalog'].detail.includes('known entries: gpu-box'),
+    byName['gate-runner-catalog'].detail,
+  );
+  for (const name of ['ssh', 'remote-docker', 'remote-act']) {
+    assertEqual(byName[name].ok, false, `${name} cannot pass without a target`);
+    assertEqual(byName[name].present, null, `${name} was not observed`);
+    assert(byName[name].detail.startsWith('not probed:'), byName[name].detail);
+  }
+});
+
+test('doctor stage 88: SSH unreachable ⇒ ssh row fails (exit-code judged, BatchMode — no prompts); docker/act read "not probed" — exit 1', () => {
+  const fx = fixture();
+  healthy(fx);
+  fx.stub('ssh', SSH_DOWN);
+  const { project, env } = remoteFixture(fx);
+  const { out, code } = run(fx, ['--cwd', project], env);
+  assertEqual(code, 1);
+  const { byName } = rowsByName(out);
+  assertEqual(byName['gate-runner-catalog'].ok, true, 'the name itself resolves');
+  assertEqual(byName.ssh.ok, false);
+  assert(byName.ssh.detail.includes('failed: Permission denied (publickey).'), byName.ssh.detail);
+  for (const name of ['remote-docker', 'remote-act']) {
+    assertEqual(byName[name].present, null, `${name} not observed over a dead channel`);
+    assert(byName[name].detail.startsWith('not probed:'), byName[name].detail);
+  }
+});
+
+test('doctor stage 88: remote docker down and remote act absent/unparseable — each row says why, exit 1', () => {
+  const fx = fixture();
+  healthy(fx);
+  fx.stub('ssh', SSH_REMOTE_BROKEN);
+  const { project, env } = remoteFixture(fx);
+  const broken = run(fx, ['--cwd', project], env);
+  assertEqual(broken.code, 1);
+  let byName = rowsByName(broken.out).byName;
+  assertEqual(byName.ssh.ok, true, 'the channel itself is up');
+  assertEqual(byName['remote-docker'].ok, false);
+  assert(
+    byName['remote-docker'].detail.includes('is Docker installed there and the daemon running?'),
+    byName['remote-docker'].detail,
+  );
+  assertEqual(byName['remote-act'].ok, false);
+  assert(
+    byName['remote-act'].detail.includes('is nektos/act installed there?'),
+    byName['remote-act'].detail,
+  );
+  // A remote act that runs but prints no parseable x.y.z fails closed too —
+  // the stage-87 act-version shape, held remotely.
+  const fx2 = fixture();
+  healthy(fx2);
+  fx2.stub('ssh', SSH_ACT_UNPARSEABLE);
+  const r2 = remoteFixture(fx2);
+  const unparseable = run(fx2, ['--cwd', r2.project], r2.env);
+  assertEqual(unparseable.code, 1);
+  byName = rowsByName(unparseable.out).byName;
+  assertEqual(byName['remote-act'].ok, false);
+  assert(
+    byName['remote-act'].detail.includes('could not parse a version from remote `act --version`'),
+    byName['remote-act'].detail,
+  );
+});
+
+test('doctor stage 88: VERITY_SSH_BIN picks the probed ssh (the stage-87 override convention)', () => {
+  const fx = fixture();
+  healthy(fx); // deliberately NO ssh stub on PATH
+  const alt = fs.mkdtempSync(path.join(os.tmpdir(), 'verity-doctor-altssh-'));
+  const sshBin = path.join(alt, 'my-ssh');
+  fs.writeFileSync(sshBin, `#!/bin/sh\n${SSH_OK}\n`);
+  fs.chmodSync(sshBin, 0o755);
+  const { project, env } = remoteFixture(fx);
+  const { out, code } = run(fx, ['--cwd', project], { ...env, VERITY_SSH_BIN: sshBin });
+  assertEqual(code, 0, 'overridden ssh probed green');
+  const { byName } = rowsByName(out);
+  assertEqual(byName.ssh.ok, true);
+  assert(byName.ssh.detail.includes(sshBin), 'the detail names the overridden binary');
+});

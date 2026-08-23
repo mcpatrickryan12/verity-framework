@@ -154,4 +154,23 @@ function json(args, opts = {}) {
   return JSON.parse(run(args, opts));
 }
 
-module.exports = { run, json, GhError, backoffMs, classify };
+// A GitHub "owner/name" repository slug — GitHub's owner/name charset exactly:
+// letters, digits, '.', '_', '-', ONE slash, neither side empty. This is a pure
+// predicate; it touches nothing in run/json.
+//
+// Why it lives here (stage 52, #135): callers interpolate a repo straight into
+// the `gh api` PATH (operator-act.cjs apiBase, worker/index.cjs apiBase,
+// locks.cjs apiBase) and `gh api` TRUNCATES the endpoint at `?` / `#` —
+// everything after is a query string / fragment. So an unvalidated repo is an
+// endpoint-injection vector: `acme/widget/branches/main/protection?` turns a
+// label DELETE into `DELETE /repos/acme/widget/branches/main/protection`. One
+// shared predicate keeps every interpolation site honest.
+const REPO_SLUG_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+function isRepoSlug(value) {
+  // JS `$` matches BEFORE a trailing newline, so an anchored charset test alone
+  // would accept 'acme/widget\n'. Reject any newline explicitly.
+  return typeof value === 'string' && !/[\r\n]/.test(value) && REPO_SLUG_RE.test(value);
+}
+
+module.exports = { run, json, GhError, backoffMs, classify, isRepoSlug };

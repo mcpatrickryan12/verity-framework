@@ -352,7 +352,9 @@ test('e2e: the announcement happens ONCE — the next tick stays quiet (no label
   // The announcement dispatched nothing, so its ledger row is a VERIFIED $0 —
   // never an unknown-cost cell that would trip the stage-18/21 startup
   // breaker on the very next tick (exit 30 unknown-cost-budget, unapprovable).
-  const row = usageRows(fx).find((r) => r.endsWith(',ci:unverified'));
+  // gate is column 12 (index 11); stage 53 appended provider,model after it, so
+  // the stamp is no longer the last cell — match it by column, not by suffix.
+  const row = usageRows(fx).find((r) => r.split(',')[11] === 'ci:unverified');
   assert(
     row !== undefined,
     `the announcement wrote its gate-stamped usage row, got: ${usageRows(fx)}`,

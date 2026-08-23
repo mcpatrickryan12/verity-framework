@@ -87,6 +87,7 @@ const autonomy = require('./autonomy.cjs');
 const { LABELS } = require('./labels.cjs');
 const ledger = require('./ledger.cjs');
 const stateSnapshot = require('./agents/state-snapshot.cjs');
+const substrateLocal = require('./substrate-local.cjs');
 
 const SCHEMA = 1;
 const GATE_LABEL = 'verity:awaiting-approval';
@@ -102,6 +103,33 @@ const STATE_GATE = 'state:unverified';
 // The ONE opt-out value. Anything else — including absence, null, and every
 // typo — resolves to gating (default-closed, like the rest of the schema).
 const ALLOW_WITHOUT_MERGE = 'allow_without_merge';
+// Stage 68 (ADR-0027): a just-opened PR whose CI checks GitHub has NOT yet
+// registered reads as an empty rollup → CI_UNKNOWN, indistinguishable from a
+// repository with no CI. Within this bounded window after the PR was opened the
+// ci:unverified gate is DEFERRED: the stage reports `waiting_for_ci` (below)
+// instead of gating a healthy PR for a human. Once the PR is OLDER than the
+// grace with STILL-empty CI it gates exactly as today (the genuine "no CI"
+// case, merely delayed). The grace defers the GATE only — it never advances a
+// stage to review/merge (empty ⇒ unknown ⇒ never green; rollupState unchanged).
+const CI_REGISTRATION_GRACE = 90_000;
+// Stage 70 (ADR-0027): the bounded clock-skew tolerance for the recency guard.
+// `createdAt` is GitHub's AUTHORITATIVE timestamp; the local box's clock is not.
+// When the local clock runs behind GitHub (ordinary NTP skew — a live box was
+// measured ~7.5s behind), a just-opened PR's `createdAt` is slightly FUTURE-
+// dated vs `Date.now()`, so `age = now - registeredAt` is negative. A strict
+// `age >= 0` lower bound fail-closes those healthy fresh PRs into the gate. We
+// therefore tolerate a bounded NEGATIVE age (past OR near-future within skew) as
+// "just opened" and defer. The bound stays generous but finite so a wildly-
+// future timestamp (`age <= -MAX_CLOCK_SKEW_MS`, implausible for a real GitHub
+// PR) still gates — fail-closed on the absurd case.
+const MAX_CLOCK_SKEW_MS = 300_000;
+// A recency-deferred stage carries this on its (non-gated, non-work) decision:
+// it is not a human gate (no awaiting-approval, no announce) and not workable
+// yet (no build/review dispatch) — the honest "CI is still registering" answer.
+// It maps to the operator snapshot's existing `waiting_for_ci` bucket (the PR's
+// stage derives as `building`, which that bucket already counts), so
+// benchmark.driveStatus reads it as `working` and keeps driving.
+const WAITING_FOR_CI = 'waiting_for_ci';
 
 function labelSet(item) {
   const labels = item?.labels || [];
@@ -189,11 +217,46 @@ function decide(proj, snapshot = {}, opts = {}) {
       continue;
     }
     const decision = decideStage(n, stage, labels, snapshot, opts);
+    // Stage 68 (ADR-0027): a stage whose ci:unverified gate is DEFERRED because
+    // its PR was just opened (CI still registering) keeps waiting but stops
+    // blocking — the same "drop the waiting item, pick from the rest" rule an
+    // announced gate uses below. If nothing else is workable it is returned, so
+    // the tick reports `waiting_for_ci` rather than a bare idle that would read
+    // as "nothing to do". It NEVER takes the tick as work and NEVER gates.
+    if (decision.status === WAITING_FOR_CI) {
+      if (waiting === null) {
+        waiting = decision;
+      }
+      continue;
+    }
     if (decision.action === 'gated' && decision.announced === true) {
       // The pause is already visible on GitHub — keep waiting, stop blocking.
       if (waiting === null) {
         waiting = decision;
       }
+      continue;
+    }
+    // Stage 77: serialize build-through under auto-merge. A FRESH build for a
+    // LATER stage (action work, role build, and NO PR yet — target.kind is not
+    // 'pr') while an EARLIER stage is still in flight (already stashed as
+    // `waiting`: waiting_for_ci or an announced gate) would open a SECOND
+    // concurrent PR before the first merges — so this stage forks off a base
+    // that does not yet contain its predecessor (the exact conflict this stage
+    // fixes). Under review trust >= 1 (auto-merge), skip it so the tick falls
+    // through to `return waiting` and each stage forks off a base already
+    // containing the ones before it. Gated STRICTLY on trust >= 1: at trust 0 /
+    // undefined the run gates after one stage anyway, so behaviour is byte-
+    // identical. A re-build of an existing PR (target.kind 'pr') and any
+    // review/merge decision are NOT suppressed — they advance the in-flight
+    // stage, which is the goal.
+    if (
+      waiting !== null &&
+      typeof opts.reviewTrust === 'number' &&
+      opts.reviewTrust >= 1 &&
+      decision.action === 'work' &&
+      decision.role === 'build' &&
+      decision.target?.kind !== 'pr'
+    ) {
       continue;
     }
     // Workable, or a FRESH gate that must take the tick (stage 22
@@ -251,6 +314,55 @@ function decideStage(n, stage, labels, snapshot, opts) {
   // Stage 19: CI Verity cannot verify. Checked AFTER the label gate so an
   // explicit human gate keeps reporting itself exactly as it always has.
   if (unverified && !allowUnverified) {
+    // Stage 68 (ADR-0027): the recency guard. An empty rollup on a JUST-OPENED
+    // PR is very likely GitHub not having registered its checks yet, not a repo
+    // with no CI. When the PR carries a registration timestamp AND is younger
+    // than the grace, DEFER the gate: report `waiting_for_ci` (non-terminal — no
+    // gate, no awaiting-approval, no review dispatch) so a healthy PR is not
+    // parked for a human seconds before its CI reports. `now` and the grace are
+    // INJECTED via `opts` so the decision stays PURE (tests never touch the wall
+    // clock); the outermost real caller (dispatch) passes Date.now(). FAIL-
+    // CLOSED: with NO clock (a pure/legacy caller that passes no `now`) OR NO
+    // timestamp (an old/injected snapshot), the guard does nothing and the gate
+    // fires exactly as before — "no timestamp" is NEVER read as "recent". The
+    // guard defers the gate ONLY; the empty rollup is still unknown, still never
+    // green, so no path advances to review/merge on non-green CI.
+    const pr =
+      stage.pr === null || stage.pr === undefined
+        ? undefined
+        : (snapshot.prs || []).find((p) => p.number === stage.pr);
+    const now = typeof opts.now === 'number' ? opts.now : null;
+    const graceMs =
+      typeof opts.ciGraceMs === 'number' && opts.ciGraceMs >= 0
+        ? opts.ciGraceMs
+        : CI_REGISTRATION_GRACE;
+    const registeredAt = ledger.prRegisteredAt(pr);
+    if (now !== null && registeredAt !== null) {
+      const age = now - registeredAt;
+      // Stage 70: tolerate bounded clock skew. A negative `age` means the local
+      // clock is behind GitHub's authoritative `createdAt`; a PR whose createdAt
+      // is within skew-tolerance of now (past OR near-future) is JUST-OPENED →
+      // defer. A genuinely old PR (age >= graceMs) still gates; a wildly-future
+      // timestamp (age <= -MAX_CLOCK_SKEW_MS) still gates (fail-closed on absurd).
+      if (age > -MAX_CLOCK_SKEW_MS && age < graceMs) {
+        return {
+          schema: SCHEMA,
+          // NOT `gated` (no human park) and NOT `work` (no dispatch): the
+          // scanner's P5 tier yields nothing for a non-work decision and the
+          // worker announces nothing for a non-gated one, so the tick idles
+          // cleanly while CI registers — no model run, no awaiting-approval
+          // label. The `status` marker is what carries the real state to the
+          // operator snapshot / the decide() loop above.
+          action: 'idle',
+          role,
+          args,
+          gate: null,
+          target,
+          status: WAITING_FOR_CI,
+          reason: `stage ${n}: PR #${stage.pr} reports no CI checks yet — GitHub may not have registered them (PR opened ${Math.max(0, Math.round(age / 1000))}s ago, within the ${Math.round(graceMs / 1000)}s CI-registration grace). Waiting for CI to register before deciding — not gating, and NOT merging (nothing merges on unverified CI)`,
+        };
+      }
+    }
     return {
       schema: SCHEMA,
       action: 'gated',
@@ -297,15 +409,45 @@ function resolveUnverifiedCi(flags, cwd) {
   }
 }
 
+// Stage 77: resolve the review trust for the build-through serialization guard,
+// the SAME way resolveUnverifiedCi resolves its knob — off the policy the worker
+// loads, so `verity next` and the worker never disagree. Any problem reading it
+// (missing file, invalid YAML, no `.verity`) fails CLOSED to undefined, which is
+// trust < 1: the guard stays off and trust-0 behaviour is byte-identical.
+function resolveReviewTrust(cwd) {
+  try {
+    return autonomy.loadPolicy(cwd).review.trust;
+  } catch {
+    return undefined;
+  }
+}
+
 function dispatch(_args, flags, opts = {}) {
   const cwd = flags.cwd || process.cwd();
   // Stage 34: `--repo` (additive) aims the snapshot at a named repository;
   // fetchSnapshot resolves flag → GH_REPO → cwd remotes, so the worker's scan
   // path is covered by the GH_REPO its runOnce already exports (stage 29).
-  const snapshot = opts.snapshot || ledger.fetchSnapshot(cwd, { repo: flags.repo });
+  // Stage 80 (ADR-0029): the snapshot ACQUIRER is the delivery-substrate seam —
+  // the stage-79 `policy.substrate` selects the local driver
+  // (substrate-local.fetchLocalSnapshot) when 'local'; 'github'/absent routes to
+  // ledger.fetchSnapshot with identical args (byte-identical). decide() below is
+  // substrate-blind: it consumes whichever snapshot arrives, unchanged.
+  const snapshot =
+    opts.snapshot || substrateLocal.fetchSubstrateSnapshot(cwd, { repo: flags.repo });
   const proj = ledger.project(cwd, { snapshot });
   const decision = decide(proj, snapshot, {
     unverifiedCi: resolveUnverifiedCi(flags, cwd),
+    // Stage 77: the review trust gates build-through serialization. Resolved
+    // here (never inside decide/decideStage — they stay pure and read `opts`)
+    // from the same policy the worker loads. Fail-closed to undefined (< 1), so
+    // the guard is off and trust-0 behaviour is byte-identical.
+    reviewTrust: resolveReviewTrust(cwd),
+    // Stage 68 (ADR-0027): the outermost real caller stamps the clock for the
+    // ci:unverified recency guard. `decide`/`decideStage` stay pure — they read
+    // `opts.now`, never Date.now(). Injectable (opts.now / opts.ciGraceMs) so
+    // tests drive the guard deterministically without the wall clock.
+    now: typeof opts.now === 'number' ? opts.now : Date.now(),
+    ciGraceMs: opts.ciGraceMs,
   });
   // Stage 24 (ADR-0013): a contained role cannot read GitHub, so the facts its
   // workflow needs (stage status, the `next` list, dependency/PR/CI state)
@@ -324,6 +466,13 @@ function dispatch(_args, flags, opts = {}) {
 
 module.exports = {
   decide,
+  // Stage 48: the per-stage mapping and the knob resolver are exported (pure,
+  // read-only) so the operator projection (operator.cjs) reuses the REAL next
+  // derivation for its `work` items' `next` field instead of forking a second
+  // copy of the engine→contract mapping.
+  decideStage,
+  resolveUnverifiedCi,
+  resolveReviewTrust,
   dispatch,
   exitCodeFor,
   SCHEMA,
@@ -332,4 +481,7 @@ module.exports = {
   CI_GATE,
   STATE_GATE,
   ALLOW_WITHOUT_MERGE,
+  CI_REGISTRATION_GRACE,
+  MAX_CLOCK_SKEW_MS,
+  WAITING_FOR_CI,
 };

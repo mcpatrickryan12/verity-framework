@@ -142,8 +142,23 @@ function latestTag(tags) {
 // it gains no field. Every caller that turns a projection into an ANSWER must
 // gate on ledger.snapshotVerified(snapshot) first: `dispatch` below refuses, and
 // next.decide() gates at `state:unverified` (stage 20 consumer audit, issue #60).
+// Stage 85 (ADR-0029; operator-smoke finding): the DEFAULT snapshot acquisition
+// for project()/dispatch() goes through the delivery-substrate seam — `verity
+// state` is part of every role's own workflow (build.md/review.md shell it
+// back-to-back), and its direct fetchSnapshot was the residual gh triple
+// (issue list / pr list / repo view, GH_REPO-targeted) the real-model local
+// smoke caught. Lazy require: substrate-local requires ledger at its top
+// level, so a top-level require back would be a CJS cycle; by call time both
+// modules are fully loaded (the stage.cjs↔git-lifecycle precedent). 'github'
+// and an unreadable policy route straight back to fetchSnapshot(cwd, {repo}) —
+// byte-identical args, spawn-arg pinned.
+function acquireSnapshot(cwd, repo) {
+  const substrateLocal = require('./substrate-local.cjs');
+  return substrateLocal.fetchSubstrateSnapshot(cwd, { repo });
+}
+
 function project(cwd, opts = {}) {
-  const snapshot = opts.snapshot || fetchSnapshot(cwd, { repo: opts.repo });
+  const snapshot = opts.snapshot || acquireSnapshot(cwd, opts.repo);
   const stages = readStages(cwd).map((s) => deriveStatus(s, snapshot));
   return {
     online: snapshot.online !== false,
@@ -320,6 +335,23 @@ function ciStateOf(pr) {
   return pr && pr.ciGreen === true ? CI_GREEN : CI_RED;
 }
 
+// Stage 68 (ADR-0027): the registration-relevant timestamp of a snapshot PR —
+// when it was opened (`createdAt`), as epoch ms — or `null` when absent or
+// unparseable. This is what the ci:unverified recency guard (next.decide) reads
+// to defer the gate for a bounded window on a JUST-OPENED PR whose CI checks
+// GitHub has not registered yet. FAIL-CLOSED by construction: a PR with no
+// parseable timestamp returns null, and the guard then gates exactly as before
+// — "no timestamp" is NEVER treated as "recent" (that would suppress a real
+// no-CI gate). It reads a timestamp only; it does NOT touch the green/red/
+// unknown model — an empty rollup is still unknown, still never green.
+function prRegisteredAt(pr) {
+  if (!pr || typeof pr.createdAt !== 'string') {
+    return null;
+  }
+  const ms = Date.parse(pr.createdAt);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 // Stage 34 (canary run 5, defect N5): WHICH repository the snapshot describes
 // is resolved HERE, upstream of gh, in gh's own documented precedence — an
 // explicit --repo (the caller's flag), then the GH_REPO environment variable,
@@ -378,7 +410,12 @@ function fetchSnapshot(cwd, opts = {}) {
     '--limit',
     '300',
     '--json',
-    'number,title,state,headRefName,statusCheckRollup,labels',
+    // Stage 68 (ADR-0027): `createdAt` is ADDITIVE — the registration-relevant
+    // timestamp (when the PR was opened) that the ci:unverified recency guard in
+    // next.decide reads to tell a JUST-OPENED PR (checks not registered yet)
+    // apart from a genuinely CI-less one. A snapshot/PR without it behaves
+    // exactly as before (the guard falls back to gating).
+    'number,title,state,headRefName,statusCheckRollup,labels,createdAt',
     ...target,
   ]);
   // Every PR carries BOTH readings: the three-state `ciState` (the truth) and
@@ -460,7 +497,11 @@ function dispatch(args, flags) {
   // healthy path is byte-identical.
   // Stage 34: `--repo` (additive) points the GitHub half of the derivation at
   // a named repository — fetchSnapshot resolves flag → GH_REPO → cwd remotes.
-  const snapshot = fetchSnapshot(cwd, { repo: flags.repo });
+  // Stage 85 (ADR-0029): acquired through the substrate seam — on a
+  // `substrate: local` repo this reads the record store + git (zero gh), so a
+  // role's own `verity state` calls (build.md steps 1/6, review.md step 1)
+  // never touch GitHub on local; github/absent is byte-identical fetchSnapshot.
+  const snapshot = acquireSnapshot(cwd, flags.repo);
   if (!snapshotVerified(snapshot)) {
     throw new StateUnverifiedError(`verity state ${verb}: ${unverifiedMessage(snapshot)}`);
   }
@@ -496,6 +537,7 @@ module.exports = {
   rollupState,
   rollupGreen,
   ciStateOf,
+  prRegisteredAt,
   readStages,
   parseStageFile,
   deriveStatus,

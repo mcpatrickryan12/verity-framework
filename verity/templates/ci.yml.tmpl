@@ -1,8 +1,12 @@
 name: CI
 # {{name}} — Verity hygiene gate (stack-agnostic).
-# Honestly green on a fresh scaffold: secret-scan + a structure check, no faked
-# pass. Lint and test gates are added when the Architect chooses the stack and the
-# walking skeleton lands (the progressive gate — framework-spec §3).
+# Secret-scan + a structure check, no faked pass. Project gates (lint/test/…)
+# live in ONE committed place — .verity/gates.json — executed by the `gates`
+# job below AND by the Verity local gate runner (stage 82, ADR-0029 §4), so CI
+# can never drift from the gates that were green locally. Until the Architect
+# defines that file (when the stack and walking skeleton land — the
+# progressive gate, framework-spec §3), the gates job FAILS with instructions:
+# a repo with no committed gates must never read green (ADR-0028).
 on:
   pull_request:
   push:
@@ -14,6 +18,20 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # Verity single-source gates (stage 82, ADR-0029 §4): this job executes the
+  # SAME committed `.verity/gates.json` the local gate runner executes —
+  # ordered, named commands judged by EXIT CODE only (ADR-0028: never through
+  # a pipe, never parsed output). No definition ⇒ the runner FAILS LOUDLY with
+  # instructions — a repo whose gates are missing must never read green (the
+  # issue-#203 defect class, closed by construction). Define your gates in
+  # .verity/gates.json as the stack lands; the runner script is committed at
+  # .verity/run-gates.cjs by the scaffold.
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the committed gate definition (.verity/gates.json)
+        run: node .verity/run-gates.cjs
   structure:
     runs-on: ubuntu-latest
     steps:

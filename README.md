@@ -117,6 +117,13 @@ verity deployment path           # where the catalog lives
 
 When the Architect picks a target it sets up the per-app access file — `verity deployment init-access` gitignores the real file and commits the "ask the admin" pointer — then writes `.verity/deploy-access.md` with how to reach this app's host. From there, `/verity:ship` deploys to that target. (`verity deployment access` tells a teammate whether they have the file, and who to ask if not.)
 
+## Local substrate & gate runners *(new in 1.3.0)*
+
+By default GitHub stays the single source of truth — nothing changes unless you opt in. Two new, independent choices in `.verity/autonomy.yml`:
+
+- **`substrate: local`** — a fully GitHub-free early-development mode ("Fresh"): work items are committed JSON records, merges are engine-performed behind the same merge bar, and green comes from a SHA-pinned, exit-code-judged run of your committed gate definition (`.verity/gates.json`) — zero GitHub API calls. *Honest label:* this is step 1 of the Fresh roadmap; graduation (replaying a local project into a real GitHub repo) is not built yet, so use it for early iteration and benchmarking, not for projects that must land on GitHub tomorrow.
+- **`gate_runner: direct | localhost | remote:<name> | github-actions`** — where that gate definition executes. `localhost` runs it via [nektos/act](https://github.com/nektos/act) in Docker on your machine; `remote:<name>` pushes the judged commit to a host from your global catalog (`~/.verity/gate-runners.md` — same pattern as deployment methods: named entries, credential *locations*, never secrets; `verity gate-runners list|show|edit`) and runs act there over SSH, so gates run on hardware the model never touches. Absent config is byte-identical to today; an unreachable or unprovisionable runner refuses and the branch stays unverified — never a silent fallback. `verity doctor` probes whatever runner you configured.
+
 ## Guides
 
 Start with the quickstart, then go deeper as you need to:

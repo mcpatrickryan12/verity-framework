@@ -117,6 +117,52 @@ function readPolicy(resolved) {
   return { allowlist: readAllowlist(resolved.toolsFile) };
 }
 
+// --- delivery-substrate narrowing (stage 82, ADR-0029) -------------------------
+// The claude analog of the codex capability narrowing stage 81 shipped
+// (agents/policy.cjs narrowForSubstrate): on the LOCAL substrate no role
+// invokes `gh` and no role needs the network — GitHub reads/writes have no
+// target (the origin is a bare sibling directory, work-items are committed
+// files) — so a local dispatch's T06 allowlist is the role's declared list
+// MINUS every gh/network-granting entry. Claude's permission surface IS the
+// allowlist (ADR-0007: no capability policy), so narrowing happens here, on
+// the exact strings passed to --allowed-tools; the harness itself then
+// enforces the narrowed surface (deny-by-default), which is what makes this
+// an honest restriction rather than theater (ADR-0011).
+//
+// Narrowing ONLY, by construction: entries are removed, never added or
+// rewritten — and any substrate that is not exactly 'local' returns the INPUT
+// OBJECT untouched (same reference), so the github path is byte-identical.
+// Stripped entry classes:
+//   Bash(gh …)          every gh grant — `Bash(gh pr create:*)` etc. On local
+//                       there is no PR/issue to talk to; Verity performs the
+//                       substrate's write ops itself (ADR-0026/0029).
+//   WebFetch/WebSearch  the network-granting tools (bare or parameterized).
+// Everything else (Read/Edit/git/npm/npx/verity …) stays: those are exactly
+// the local acts a Fresh build performs. Fail closed on the degenerate case:
+// a role whose allowlist narrows to NOTHING is refused (readAllowlist's own
+// "allow nothing must be impossible" rule), never dispatched tool-less.
+const LOCAL_SUBSTRATE_DENIED_TOOLS = [
+  /^\s*Bash\(\s*gh([\s:)]|$)/, // any gh invocation grant
+  /^\s*WebFetch\s*(\(|$)/,
+  /^\s*WebSearch\s*(\(|$)/,
+];
+
+function narrowForSubstrate(policy, substrate) {
+  if (substrate !== 'local') {
+    return policy; // same reference — github/absent stays byte-identical
+  }
+  const allowlist = policy.allowlist.filter(
+    (t) => !LOCAL_SUBSTRATE_DENIED_TOOLS.some((re) => re.test(t)),
+  );
+  if (allowlist.length === 0) {
+    throw new AgentExecError(
+      "--substrate local strips every gh/network-granting tool from this role's allowlist, leaving NO tools at all — refusing the dispatch rather than running a role whose surface Verity cannot honestly narrow (stage 82, ADR-0029)",
+      'unenforceable-policy',
+    );
+  }
+  return { ...policy, allowlist };
+}
+
 // Transcript naming per contracts/agent-result.md §Consumes: Claude keeps the
 // original `<role>.jsonl` (byte-identical paths — codex adds its own suffix).
 function transcriptFilename(role) {
@@ -306,6 +352,7 @@ module.exports = {
   checkVersion,
   countToolCalls,
   execute,
+  narrowForSubstrate,
   normalizeResult,
   normalizeUsage,
   parseTranscript,

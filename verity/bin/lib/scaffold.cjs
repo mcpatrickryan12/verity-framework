@@ -19,6 +19,14 @@ const FILES = [
   { out: '.github/workflows/ci.yml', tmpl: 'ci.yml.tmpl' },
   { out: '.github/ISSUE_TEMPLATE/bug_report.yml', tmpl: 'bug_report.yml.tmpl' },
   { out: 'STATUS.md', tmpl: 'STATUS.md.tmpl' },
+  // Stage 82 (ADR-0029 §4): the thin definition-reading runner the scaffolded
+  // CI workflow invokes — it executes the committed single-source
+  // `.verity/gates.json` (the SAME file `verity gates run` executes), judged
+  // by exit code only (ADR-0028), and FAILS LOUDLY when no definition exists.
+  // Deliberately NOT a scaffolded gates.json: a default gate list would be a
+  // fabricated green — the Architect defines the real gates when the stack
+  // lands, and until then the gates job honestly fails.
+  { out: '.verity/run-gates.cjs', tmpl: 'run-gates.cjs.tmpl' },
 ];
 
 function readTemplate(name) {

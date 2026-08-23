@@ -1,6 +1,6 @@
 {
   "name": "verity-framework",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Verity \u2014 a CI/CD-native, GitHub-native AI delivery framework: specialized roles from idea to operated production, plus an optional headless autonomy worker, gated and audited through GitHub.",
   "keywords": [
     "verity",

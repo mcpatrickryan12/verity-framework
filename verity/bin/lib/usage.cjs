@@ -5,7 +5,7 @@
 // append-only, one row PER ROLE INVOCATION (rows of one worker run share a
 // run_id):
 //
-//   timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate
+//   timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate,provider,model
 //
 // Field encodings:
 //   - timestamp  ISO-8601 UTC (new Date().toISOString())
@@ -33,12 +33,20 @@
 //                the stamp too — the failure path parks at the same gate, so
 //                a failed row can coexist with a gate cell; the stamp means
 //                "a human was asked", not "the run ended gated"
+//   - provider   stage 53: the agent provider that produced this row (e.g.
+//                'claude', 'codex'); '' when the run recorded none (and on
+//                pre-stage-53 rows). Telemetry/provenance only — never summed.
+//   - model      stage 53: the model id that produced this row (e.g.
+//                'gpt-5-codex'); '' when absent/null (a null model — the claude
+//                default — writes '', NEVER a fabricated value) and on
+//                pre-stage-53 rows. Telemetry/provenance only — never summed.
 //   - all cells  RFC-4180 escaped anyway (quoted iff containing , " or newline)
 //
-// ADDITIVE-ONLY EVOLUTION: pre-stage-3 files (9 columns, one row per run) and
-// pre-stage-21 files (11 columns, no gate) are still valid — readers accept
-// all three headers and all three row widths; missing trailing columns read as
-// tool_calls=0, role='', gate=''. Because a run may span several rows, rollups
+// ADDITIVE-ONLY EVOLUTION: pre-stage-3 files (9 columns, one row per run),
+// pre-stage-21 files (11 columns, no gate) and pre-stage-53 files (12 columns,
+// no provider/model) are still valid — readers accept all four headers and all
+// four row widths; missing trailing columns read as tool_calls=0, role='',
+// gate='', provider='', model=''. Because a run may span several rows, rollups
 // count `runs` as DISTINCT run_id values (identical to row-count on legacy
 // files, where every row had its own run_id) so `checkDailyLimits` semantics
 // are unchanged across formats.
@@ -85,8 +93,13 @@ const COLUMNS = [
   'tool_calls',
   'role',
   'gate',
+  'provider',
+  'model',
 ];
 const HEADER = COLUMNS.join(',');
+// Pre-stage-53 files: 12 columns, no provider/model. Still readable forever.
+const STAGE21_COLUMNS = COLUMNS.slice(0, 12);
+const STAGE21_HEADER = STAGE21_COLUMNS.join(',');
 // Pre-stage-21 files: 11 columns, no gate. Still readable forever.
 const STAGE3_COLUMNS = COLUMNS.slice(0, 11);
 const STAGE3_HEADER = STAGE3_COLUMNS.join(',');
@@ -166,6 +179,10 @@ function entryFromSummary(summary, now = new Date()) {
     tool_calls: summary.tool_calls || 0,
     role: summary.role || '',
     gate: summary.gate || '',
+    // Stage 53: provenance of the agent that produced the run. A null model
+    // (the claude default) writes '' — never a fabricated value.
+    provider: summary.provider ?? '',
+    model: summary.model ?? '',
   };
 }
 
@@ -187,6 +204,11 @@ function entryFromInvocation(summary, inv, now = new Date()) {
     role: inv.role || '',
     // The RUN's terminal gate, not the invocation's — see the header note.
     gate: summary.gate || '',
+    // Stage 53: the invocation's own provider/model (worker-wide today; stage
+    // 54 makes it per-role), falling back to the run-level summary. Null/absent
+    // ⇒ '' — never a fabricated value.
+    provider: inv.provider ?? summary.provider ?? '',
+    model: inv.model ?? summary.model ?? '',
   };
 }
 
@@ -299,7 +321,12 @@ function readUsage(cwd, opts = {}) {
     if (line.trim() === '') {
       continue;
     }
-    if (line === HEADER || line === STAGE3_HEADER || line === LEGACY_HEADER) {
+    if (
+      line === HEADER ||
+      line === STAGE21_HEADER ||
+      line === STAGE3_HEADER ||
+      line === LEGACY_HEADER
+    ) {
       sawHeader = true; // header row (required on line 1; tolerated if repeated)
       continue;
     }
@@ -307,12 +334,14 @@ function readUsage(cwd, opts = {}) {
       warn(`usage.csv line 1: expected header '${HEADER}' — parsing rows anyway`);
     }
     const cells = splitCsvLine(line);
-    // Additive-only evolution: 9-column (pre-stage-3) and 11-column
-    // (pre-stage-21) rows are as valid as current ones — the missing trailing
-    // cells read as tool_calls=0, role='', gate=''.
+    // Additive-only evolution: 9-column (pre-stage-3), 11-column (pre-stage-21)
+    // and 12-column (pre-stage-53) rows are as valid as current ones — the
+    // missing trailing cells read as tool_calls=0, role='', gate='',
+    // provider='', model=''.
     if (
       cells === null ||
       (cells.length !== COLUMNS.length &&
+        cells.length !== STAGE21_COLUMNS.length &&
         cells.length !== STAGE3_COLUMNS.length &&
         cells.length !== LEGACY_COLUMNS.length)
     ) {
@@ -358,6 +387,8 @@ function readUsage(cwd, opts = {}) {
       tool_calls: toolCalls,
       role: row.role,
       gate: row.gate,
+      provider: row.provider,
+      model: row.model,
     });
   }
   if (!sawHeader && rows.length === 0 && skipped === 0) {
@@ -622,6 +653,8 @@ module.exports = {
   LEGACY_HEADER,
   STAGE3_COLUMNS,
   STAGE3_HEADER,
+  STAGE21_COLUMNS,
+  STAGE21_HEADER,
   UNKNOWN_COST_GATE,
   appendUsage,
   checkDailyLimits,
@@ -635,6 +668,7 @@ module.exports = {
   rollup,
   rollupByRole,
   splitCsvLine,
+  startOfUtcDay,
   summarizeUsage,
   todayTotals,
   usagePath,

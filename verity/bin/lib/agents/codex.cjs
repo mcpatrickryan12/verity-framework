@@ -52,6 +52,7 @@ const {
   applyOverrides: applyPolicyOverrides,
   assertEnforceable,
   loadPolicy,
+  narrowForSubstrate: narrowPolicyForSubstrate,
 } = require('./policy.cjs');
 const workspace = require('./workspace.cjs');
 
@@ -201,6 +202,15 @@ function applyOverrides(policyBag, overrides) {
   return { policy: applyPolicyOverrides(policyBag.policy, overrides) };
 }
 
+// Delivery-substrate narrowing (stage 81, ADR-0029): a 'local' run's
+// projection drops github_read/github_write/network — narrowing only, and a
+// non-'local' substrate returns the SAME policy object (github byte-identical).
+// The coordinator calls this after applyOverrides and BEFORE checkEnforceable,
+// so the narrowed policy goes through the ordinary ADR-0011 honesty gate.
+function narrowForSubstrate(policyBag, substrate) {
+  return { policy: narrowPolicyForSubstrate(policyBag.policy, substrate) };
+}
+
 // Transcript / final-message naming per contracts/agent-result.md §Consumes:
 // Codex runs sit beside Claude's `<role>.jsonl` without colliding.
 function transcriptFilename(role) {
@@ -271,6 +281,18 @@ const CREDENTIAL_READ_DENIALS = [
 ];
 const PROTECTED_WRITE_PATHS = ['.github/', '.verity/'];
 
+// Protected roots that are ALSO required READ context (issue #171). These stay
+// in PROTECTED_WRITE_PATHS — the gate still rejects writes to them — but are
+// PRESENT (checked out) in the tier-2 shaped workspace rather than absented,
+// because the role reads them: the plan role's step 1 runs `verity identity
+// get`, which reads `<cwd>/.verity/identity.json`. Absenting `.verity/` made
+// that read fail and Codex RECREATE the file, tripping the containment gate on
+// a write the role never meant to make. `.verity/` holds only non-secret repo
+// metadata — credential stripping is a SEPARATE mechanism (childEnv) — so
+// presenting it read-only exposes nothing a credential. `.github/` is NOT a
+// read context, so it stays absent (withheld) and gated.
+const READ_CONTEXT_PATHS = ['.verity/'];
+
 // --- credential stripping (ADR-0011 layer 2 — a PRIMARY mechanism) -------------
 // Before stage 11 `execute()` passed no `env` to spawnSync, so the Codex child
 // inherited the FULL parent environment — every token the operator (or CI) had
@@ -315,6 +337,14 @@ const BASELINE_ENV_PASSLIST = [
   // grants model access, which the role has by definition — it grants nothing
   // about the repository, a remote, or any external system.
   'OPENAI_API_KEY',
+  // Stage 85 (ADR-0029): the worker's frozen-run substrate pin. A contained
+  // role shells engine commands (`verity state`, `verity stage pr`) from a
+  // checkout whose tree can PREDATE the substrate policy; without the pin the
+  // cwd re-derivation flips them onto the github paths mid-local-run
+  // (operator-smoke runs 4/5). It carries NO credential and grants nothing —
+  // it is the engine telling its own CLI which substrate this run already
+  // resolved (only 'local' is honored; default-absent ⇒ byte-identical).
+  'VERITY_SUBSTRATE',
 ];
 
 // Credentials, keyed by the capability that grants them. A capability the role
@@ -424,6 +454,13 @@ function renderPrompt(file, roleArgs, ctx = {}) {
   };
   let text = renderRole(file, options, 'codex');
   text = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+  // A rendered role prompt carries `$verity-<sibling>` handoff references (from the
+  // install-pass `/verity:<role>` → `$verity-<role>` rewrite, which is correct for an
+  // INTERACTIVE SKILL.md a human types into, but a LIVE explicit-invocation token in a
+  // HEADLESS `codex exec` prompt — the model auto-invokes it instead of running THIS
+  // role (issue #170)). Neutralize them to inert prose; ADR-0006 keeps skills
+  // explicit-invocation-only, so a handoff must never fire from a role's own body.
+  text = text.replace(/\$verity-([a-z][a-z0-9-]*)/g, 'the verity:$1 role');
   const args = roleArgs.join(' ');
   text = text.split(CODEX_ARGUMENTS_PLACEHOLDER).join(args);
   text = text.replace(/\$ARGUMENTS/g, args);
@@ -558,6 +595,7 @@ function prepareWorkspace(policyBag, { cwd, dir, keep }) {
     keep,
     policy: policyBag.policy,
     protectedPaths: PROTECTED_WRITE_PATHS,
+    readContextPaths: READ_CONTEXT_PATHS,
   });
 }
 
@@ -909,6 +947,7 @@ module.exports = {
   MERGE_AUTHORITY_DENIALS,
   MIN_CODEX_VERSION,
   PROTECTED_WRITE_PATHS,
+  READ_CONTEXT_PATHS,
   TOOL_ITEM_TYPES,
   supportsMaxTurns: false,
   // Stage 24 (ADR-0013): this driver's runtime cannot reach GitHub, so it
@@ -933,6 +972,7 @@ module.exports = {
   finalMessageFilename,
   finishGit,
   mergeWorkspace,
+  narrowForSubstrate,
   planGit,
   restoreGit,
   skipGit,

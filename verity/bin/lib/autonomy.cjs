@@ -436,9 +436,114 @@ const SPEC = {
       // disposable shaped workspace and gates what may propagate back.
       // UNATTENDED codex autonomy (`mode: autonomous`) is REFUSED below 2.
       containment_tier: { type: 'enum', values: [1, 2] },
+      // Stage 63 (ADR-0026, #176) — ADDITIVE and DEFAULT-ABSENT: when true, the
+      // WORKER reconciles the plan role's stage-instructions/ files into
+      // `[stage N]` GitHub work-items after a successful plan (idempotently),
+      // instead of relying on the plan AGENT's own `gh issue create`. Under
+      // codex the contained plan agent CANNOT create work-items (github_write
+      // denied, GH_TOKEN stripped from childEnv, ADR-0011), so the worker seeing
+      // "no progress" stalled the pipeline at plan (#176). Absent/false is the
+      // closed state — byte-identical to today (agent-created; Claude, whose
+      // agent holds github_write, unchanged). Provider-NEUTRAL: the worker owns
+      // creation for claude and codex alike, so — unlike the codex-only knobs
+      // above — there is no cross-field provider restriction. The worker
+      // translates this into agent-exec's `--reconcile-work-items` flag; the
+      // plan.md agent step stays as the flag-OFF backstop until this defaults ON.
+      reconcile_work_items: { type: 'boolean' },
+      // Stage 54 (ADR-0024) — ADDITIVE and DEFAULT-ABSENT: an optional per-role
+      // override map. Keys are the roles the worker dispatches (build|plan|review,
+      // KNOWN_AGENT_ROLES); values are PARTIAL agent configs (provider/model +
+      // the codex knobs) validated with the SAME enums as this block. Absent ⇒
+      // byte-identical to today — the feature's own kill-switch. An UNKNOWN role
+      // key is a load error (fail closed). The per-role cross-field rules
+      // (codex-only knobs; sandbox/approval overrides may only NARROW the base)
+      // are enforced in validatePolicy below; the worker resolves the map ONCE
+      // at run start and freezes it (resolveEffectiveAgent) — never re-read
+      // mid-run, preserving the Stage-9 invariant.
+      roles: { type: 'roleMap' },
     },
   },
+  // Stage 79 (ADR-0029) — ADDITIVE and DEFAULT-ABSENT, like
+  // limits.unverified_ci_behavior and agent.containment_tier: deliberately NOT
+  // in DEFAULTS, so a pre-stage-79 file carries no substrate key. Which
+  // delivery substrate the run targets. loadPolicy resolves it ONCE onto the
+  // effective policy (absent ⇒ 'github', byte-identical to today), making
+  // `policy.substrate` the single source of truth later stages branch on; an
+  // unknown value is a load error naming the key and its allowed values (fail
+  // closed, never a silent default). 'local' RESOLVES here as a value, but the
+  // worker REFUSES it at policy consumption until the local substrate driver
+  // lands — this stage delivers the seam only.
+  substrate: { type: 'enum', values: ['github', 'local'] },
+  // Stage 86 (ADR-0030) — ADDITIVE and DEFAULT-ABSENT, the substrate key's
+  // exact pattern: deliberately NOT in DEFAULTS, so a pre-stage-86 file
+  // carries no gate_runner key. WHERE the committed gate definition executes,
+  // orthogonal to `substrate` (where truth lives). loadPolicy resolves it
+  // ONCE onto the effective policy (absent ⇒ the substrate's NATIVE runner:
+  // 'direct' on local, 'github-actions' on github — byte-identical to today),
+  // making `policy.gate_runner` the single source of truth stages 87–89
+  // branch on; an unknown value or a malformed remote:<name> is a load error
+  // naming the key and its allowed values (fail closed, never a silent
+  // default). The one REJECTED combination (local + github-actions) and the
+  // github-substrate v1 restriction are cross-field rules in validatePolicy
+  // below. 'localhost' EXECUTES as of stage 87 (the gates-act.cjs act runner:
+  // Docker + act probed at preflight, fail-closed) and 'remote:<name>' as of
+  // stage 89 (the gates-remote.cjs SSH act runner: the name resolves against
+  // ~/.verity/gate-runners.md, the pinned sha is pushed to a runner-side
+  // clone, act runs there in Docker — SSH/Docker/act probed at preflight,
+  // fail-closed, never a silent fallback to another runner).
+  gate_runner: { type: 'gateRunner' },
 };
+
+// Stage 86 (ADR-0030): the gate_runner value space — three literals plus the
+// `remote:<name>` pattern. <name> must be non-empty and catalog-name-safe
+// (letters/digits/dot/underscore/hyphen — the charset a `~/.verity/
+// gate-runners.md` catalog entry name may use), so `remote:` with an empty or
+// unsafe name fails closed like any unknown value.
+// Stage 88: the NAME charset is single-sourced here (one string, two regexes)
+// and GATE_RUNNER_NAME_RE is exported — the gate-runner catalog
+// (gate-runners.cjs parseRunners) admits exactly the entry names a
+// `remote:<name>` policy value may carry, so a name that validates at policy
+// load can always be LOOKED UP and a catalog entry that parses can always be
+// NAMED: the two ends of the resolution can never disagree on the charset.
+const GATE_RUNNER_NAME_CHARSET = '[A-Za-z0-9._-]+';
+const GATE_RUNNER_NAME_RE = new RegExp(`^${GATE_RUNNER_NAME_CHARSET}$`);
+const GATE_RUNNER_LITERALS = ['direct', 'localhost', 'github-actions'];
+const GATE_RUNNER_REMOTE_RE = new RegExp(`^remote:${GATE_RUNNER_NAME_CHARSET}$`);
+const GATE_RUNNER_ALLOWED = 'direct|localhost|remote:<name>|github-actions';
+
+function isValidGateRunner(value) {
+  return (
+    typeof value === 'string' &&
+    (GATE_RUNNER_LITERALS.includes(value) || GATE_RUNNER_REMOTE_RE.test(value))
+  );
+}
+
+// Stage 54 (ADR-0024): the roles a per-role agent override may key on — the
+// SAME set the worker dispatches (WORKER_DISPATCH_ROLES below is this exact
+// list). An override for any other key is refused: a per-role config for a role
+// the worker never runs is one the operator believes does something and does
+// not. The keys a role override may SET are a subset of the base agent block —
+// the run-wide-only isolation knobs (ignore_user_config/ignore_rules) are not
+// per-role, so a role config listing them fails closed as an unknown key.
+const KNOWN_AGENT_ROLES = ['build', 'plan', 'review'];
+const ROLE_OVERRIDE_KEYS = [
+  'provider',
+  'model',
+  'sandbox',
+  'approval',
+  'acknowledged_enforcement_gaps',
+  'containment_tier',
+];
+const ROLE_OVERRIDE_SPEC = Object.fromEntries(
+  ROLE_OVERRIDE_KEYS.map((k) => [k, SPEC.agent.keys[k]]),
+);
+
+// Restrictiveness ranks for the overrides-narrow check (ADR-0024): a per-role
+// override may only make a codex role MORE restrictive than the base block,
+// never less. sandbox: read-only is narrower than workspace-write; approval:
+// untrusted (asks for everything) is narrower than never (asks for nothing).
+const SANDBOX_RANK = { 'read-only': 0, 'workspace-write': 1 };
+const APPROVAL_RANK = { untrusted: 0, 'on-request': 1, never: 2 };
 
 function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -491,6 +596,16 @@ function checkLeaf(value, spec, keyPath, errors) {
         errors.push(`${keyPath}: must be a string or null, got ${JSON.stringify(value)}`);
       }
       break;
+    case 'gateRunner':
+      // Stage 86 (ADR-0030): the enum error shape exactly — the key and its
+      // allowed values, never a silent default; `remote:` with an empty or
+      // unsafe name is the same fail-closed refusal as any unknown value.
+      if (!isValidGateRunner(value)) {
+        errors.push(
+          `${keyPath}: must be one of ${GATE_RUNNER_ALLOWED}, got ${JSON.stringify(value)}`,
+        );
+      }
+      break;
     default:
       errors.push(`${keyPath}: internal spec error`);
   }
@@ -508,9 +623,34 @@ function walk(value, keys, prefix, errors) {
       errors.push(`${keyPath}: unknown key`);
     } else if (spec.type === 'map') {
       walk(v, spec.keys, keyPath, errors);
+    } else if (spec.type === 'roleMap') {
+      walkRoleMap(v, keyPath, errors);
     } else {
       checkLeaf(v, spec, keyPath, errors);
     }
+  }
+}
+
+// Stage 54 (ADR-0024): structural validation of the `agent.roles` map — keys
+// must be known dispatch roles (fail closed on any other), values are partial
+// agent configs validated with the SAME per-key enums/types as the base block
+// (via ROLE_OVERRIDE_SPEC — so an unknown per-role key, e.g. ignore_rules, is
+// rejected too). The cross-field rules (codex-only knobs; overrides narrow) are
+// applied against each role's EFFECTIVE provider in validatePolicy.
+function walkRoleMap(value, prefix, errors) {
+  if (!isPlainObject(value)) {
+    errors.push(`${prefix}: must be a map of role → partial agent config`);
+    return;
+  }
+  for (const [role, cfg] of Object.entries(value)) {
+    const keyPath = `${prefix}.${role}`;
+    if (!KNOWN_AGENT_ROLES.includes(role)) {
+      errors.push(
+        `${keyPath}: unknown role — agent.roles keys must be one of ${KNOWN_AGENT_ROLES.join('|')} (the roles the worker dispatches); a per-role override for a role the worker never runs is refused (fail closed, ADR-0024)`,
+      );
+      continue;
+    }
+    walk(cfg, ROLE_OVERRIDE_SPEC, keyPath, errors);
   }
 }
 
@@ -550,7 +690,96 @@ function validatePolicy(policy) {
       );
     }
   }
+  // Stage 54 (ADR-0024): the SAME cross-field rules, applied PER ROLE against
+  // each role's EFFECTIVE provider (its own override, else the base). Only runs
+  // when a structurally valid roles map is present — an absent map leaves the
+  // whole check inert, so a pre-stage-54 policy validates byte-identically.
+  if (isPlainObject(agent) && isPlainObject(agent.roles)) {
+    validateAgentRoleCrossFields(agent, errors);
+  }
+  // Stage 86 (ADR-0030) cross-field rules, applied against the EFFECTIVE
+  // substrate (absent resolves to 'github') so set/validate/load refuse the
+  // same combinations identically:
+  //   - substrate local + gate_runner github-actions is the one REJECTED
+  //     combination: it presumes a pushed GitHub branch the local substrate
+  //     says does not exist;
+  //   - the github substrate's only v1 runner is its native github-actions —
+  //     anything else refuses fail-closed (admitting it later is additive).
+  // An ABSENT gate_runner never enters either rule (it resolves to the
+  // substrate's native runner at load — byte-identical to today), and a
+  // structurally invalid value was already reported by checkLeaf above.
+  if (isValidGateRunner(policy.gate_runner)) {
+    const substrate = policy.substrate === undefined ? 'github' : policy.substrate;
+    if (substrate === 'local' && policy.gate_runner === 'github-actions') {
+      errors.push(
+        "gate_runner: 'github-actions' is refused on substrate 'local' — it presumes a pushed GitHub branch the local substrate says does not exist (ADR-0030); use direct, localhost, or remote:<name>",
+      );
+    } else if (substrate === 'github' && policy.gate_runner !== 'github-actions') {
+      errors.push(
+        `gate_runner: '${policy.gate_runner}' on substrate 'github' is not supported in v1 — the github substrate's oracle is its native github-actions runner (ADR-0030); remove the key (absent resolves to github-actions, byte-identical)`,
+      );
+    }
+  }
   return errors;
+}
+
+// The per-role half of the codex-only + overrides-narrow rules (ADR-0024). Each
+// role's EFFECTIVE provider is its own override or the base block's — the codex
+// knobs (sandbox/approval/acknowledged_enforcement_gaps/containment_tier) are
+// meaningful only when that resolves to codex, exactly as for the base. A
+// sandbox/approval override may only NARROW the base value: a null/absent base
+// is the widest, so any concrete role value narrows it (and dispatch-time
+// applyOverrides still narrows against the role's .permissions.json projection).
+function validateAgentRoleCrossFields(agent, errors) {
+  const baseProvider = agent.provider === undefined ? 'claude' : agent.provider;
+  for (const [role, cfg] of Object.entries(agent.roles)) {
+    // Structural / unknown-role problems were already reported by walkRoleMap.
+    if (!isPlainObject(cfg) || !KNOWN_AGENT_ROLES.includes(role)) {
+      continue;
+    }
+    const provider = cfg.provider === undefined ? baseProvider : cfg.provider;
+    const at = `agent.roles.${role}`;
+    if (provider !== 'codex') {
+      for (const knob of ['sandbox', 'approval']) {
+        if (cfg[knob] !== undefined && cfg[knob] !== null) {
+          errors.push(
+            `${at}.${knob}: only meaningful with codex — this role resolves to provider ${provider} (set ${at}.provider: codex or remove the override)`,
+          );
+        }
+      }
+      if (
+        Array.isArray(cfg.acknowledged_enforcement_gaps) &&
+        cfg.acknowledged_enforcement_gaps.length > 0
+      ) {
+        errors.push(
+          `${at}.acknowledged_enforcement_gaps: only meaningful with codex — this role resolves to provider ${provider} (ADR-0011)`,
+        );
+      }
+      if (cfg.containment_tier !== undefined && cfg.containment_tier !== null) {
+        errors.push(
+          `${at}.containment_tier: only meaningful with codex — this role resolves to provider ${provider} (ADR-0011)`,
+        );
+      }
+    }
+    if (
+      typeof cfg.sandbox === 'string' &&
+      typeof agent.sandbox === 'string' &&
+      SANDBOX_RANK[cfg.sandbox] > SANDBOX_RANK[agent.sandbox]
+    ) {
+      errors.push(
+        `${at}.sandbox: a per-role override may only NARROW the base agent.sandbox (${agent.sandbox}) — ${cfg.sandbox} would WIDEN it (ADR-0024 overrides-narrow)`,
+      );
+    }
+    if (
+      typeof cfg.approval === 'string' &&
+      typeof agent.approval === 'string' &&
+      APPROVAL_RANK[cfg.approval] > APPROVAL_RANK[agent.approval]
+    ) {
+      errors.push(
+        `${at}.approval: a per-role override may only NARROW the base agent.approval (${agent.approval}) — ${cfg.approval} would WIDEN it (ADR-0024 overrides-narrow)`,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -609,7 +838,40 @@ function loadPolicy(cwd) {
   if (errors.length > 0) {
     throw new PolicyError(`invalid autonomy policy (${user.path}): ${errors.join('; ')}`);
   }
-  return enforceInvariants(merged);
+  const policy = enforceInvariants(merged);
+  // Stage 79 (ADR-0029): resolve the delivery substrate ONCE, here at load —
+  // the effective policy ALWAYS carries `substrate` ('github' when the file
+  // omits it), so an absent key and an explicit 'github' resolve to the
+  // byte-identical policy object and every consumer branches on this ONE
+  // field instead of re-deriving the default. An unknown value never reaches
+  // this line (validatePolicy above is the fail-closed gate); 'local'
+  // resolves as a value and EXECUTES (stage 83 lifted the stage-79 refusal
+  // once the stage-80–82 driver landed; the worker's assertSubstrateSupported
+  // belt still refuses anything outside the enum — stage 90 trued this text).
+  const substrate = policy.substrate === undefined ? 'github' : policy.substrate;
+  // Stage 86 (ADR-0030): resolve the gate runner ONCE, right beside the
+  // substrate it is orthogonal to — the effective policy ALWAYS carries
+  // `gate_runner` (the substrate's NATIVE runner when the file omits it:
+  // 'direct' on local, 'github-actions' on github), so an absent key and an
+  // explicit native value resolve to the byte-identical policy object and
+  // every consumer branches on this ONE field. Unknown values and the
+  // rejected substrate combinations never reach this line (validatePolicy
+  // above is the fail-closed gate); 'localhost'/'remote:<name>' resolve as
+  // values and are REFUSED at the gate-execution call sites
+  // (gates.cjs assertRunnerExecutable — stage-86 seam only, no act runner
+  // exists yet).
+  const gateRunner =
+    policy.gate_runner === undefined
+      ? substrate === 'local'
+        ? 'direct'
+        : 'github-actions'
+      : policy.gate_runner;
+  // Both resolved fields are re-stamped in a FIXED trailing order so the
+  // byte-identical guarantee covers the whole object, key order included —
+  // a file that spells a native value out and a file that omits the key
+  // resolve to indistinguishable policies.
+  const { substrate: _rawSubstrate, gate_runner: _rawGateRunner, ...rest } = policy;
+  return { ...rest, substrate, gate_runner: gateRunner };
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +939,11 @@ function coerce(spec, raw, dotted) {
       throw new PolicyError(`${dotted}: expected true or false, got '${raw}'`);
     case 'stringOrNull':
       return raw === 'null' ? null : raw;
+    case 'gateRunner':
+      if (!isValidGateRunner(raw)) {
+        throw new PolicyError(`${dotted}: must be one of ${GATE_RUNNER_ALLOWED}, got '${raw}'`);
+      }
+      return raw;
     case 'stringList':
       if (raw === '' || raw === '[]') {
         return [];
@@ -728,7 +995,7 @@ function setValue(cwd, dotted, rawValue, flags = {}) {
   if (spec === null) {
     throw new PolicyError(`unknown policy key: ${dotted}`);
   }
-  if (spec.type === 'map') {
+  if (spec.type === 'map' || spec.type === 'roleMap') {
     throw new PolicyError(`${dotted} is a section, not a settable value`);
   }
   const value = coerce(spec, String(rawValue), dotted);
@@ -764,7 +1031,10 @@ function setValue(cwd, dotted, rawValue, flags = {}) {
 // (next.cjs). `validate` cross-checks THIS set because "valid" is a statement
 // about what the worker will do with the policy, and the canary caught it
 // blessing a codex policy every one of these dispatches then refused.
-const WORKER_DISPATCH_ROLES = ['build', 'plan', 'review'];
+// Stage 54 (ADR-0024): the SAME list as KNOWN_AGENT_ROLES — the per-role agent
+// override map keys on exactly the roles the worker can dispatch, kept in sync
+// by reusing the one constant.
+const WORKER_DISPATCH_ROLES = KNOWN_AGENT_ROLES;
 
 // The validate-time half of the capability honesty rule. The DISPATCH gate
 // (agents/policy.cjs assertEnforceable, exit 30 `unenforceable-policy`) is the
@@ -850,6 +1120,8 @@ module.exports = {
   DEFAULTS,
   FORCED_GATES,
   FORCED_PROTECTED_PATHS,
+  GATE_RUNNER_NAME_RE,
+  KNOWN_AGENT_ROLES,
   WORKER_DISABLED_MESSAGE,
   PolicyError,
   policyPath,

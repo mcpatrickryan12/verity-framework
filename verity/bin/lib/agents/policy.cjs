@@ -199,6 +199,39 @@ function applyOverrides(policy, overrides = {}) {
   return { ...policy, codex };
 }
 
+// --- delivery-substrate narrowing (stage 81, ADR-0029) -------------------------
+// On the LOCAL substrate no role invokes `gh` and no role needs the network:
+// GitHub reads/writes have no target (the origin is a bare sibling directory,
+// work-items are committed files) and every remaining act is filesystem + git,
+// both performed or contained by the engine. So a local run's projection is
+// STRICTLY NARROWER than the role's declared policy: the three capabilities
+// below are forced false — which also dissolves the issue-#53 class for local
+// benchmark runs (a network/gh grant that cannot be honoured there).
+//
+// Narrowing ONLY, by construction: false stays false, true becomes false,
+// nothing else is touched — and any substrate that is not exactly 'local'
+// (github, absent, unknown) returns the INPUT OBJECT untouched, so the github
+// path is byte-identical (same reference, not just same values). Runs BEFORE
+// assertEnforceable on purpose: the narrowed policy goes through the standard
+// ADR-0011 honesty gate, so a role that DID grant `network` now declares an
+// unenforceable restriction and follows the ordinary
+// acknowledged_enforcement_gaps flow — never a silent, theatrical "denial".
+// The github_* narrowing IS enforced (credential-stripping: no GH_TOKEN in the
+// child environment), and it reaches git-lifecycle.plan too: a local run's
+// `pr:` resolves false, so Verity pushes the stage branch and never shells gh.
+const LOCAL_SUBSTRATE_DENIED = ['github_read', 'github_write', 'network'];
+
+function narrowForSubstrate(policy, substrate) {
+  if (substrate !== 'local') {
+    return policy;
+  }
+  const capabilities = { ...policy.capabilities };
+  for (const cap of LOCAL_SUBSTRATE_DENIED) {
+    capabilities[cap] = false;
+  }
+  return { ...policy, capabilities };
+}
+
 // --- capability honesty rule (stage 11, ADR-0011 + ADR-0007) -------------------
 // "Codex must never appear to enforce something it does not." Every restriction
 // a role DECLARES (a capability that is false) maps here to the mechanism that
@@ -329,6 +362,7 @@ module.exports = {
   APPROVALS,
   CAPABILITY_KEYS,
   ENFORCEMENT_MECHANISMS,
+  LOCAL_SUBSTRATE_DENIED,
   MECHANISMS,
   PROVIDED_CAPABILITIES,
   SANDBOXES,
@@ -336,4 +370,5 @@ module.exports = {
   assertEnforceable,
   enforcementGaps,
   loadPolicy,
+  narrowForSubstrate,
 };

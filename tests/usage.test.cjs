@@ -58,13 +58,13 @@ test('appendUsage: creates usage.csv with the EXACT §3.4 header + row, byte-exa
   const lines = fs.readFileSync(path.join(dir, '.verity', 'usage.csv'), 'utf8').split('\n');
   assertEqual(
     lines[0],
-    'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate',
-    'header row is exactly the §3.4 column list (stage-3/stage-21 additive columns last)',
+    'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate,provider,model',
+    'header row is exactly the §3.4 column list (stage-3/21/53 additive columns last)',
   );
   assertEqual(
     lines[1],
-    '2026-06-10T12:34:56.000Z,run-20260610T120000Z-abc123,octo/fixture,plan+build+review,412034,38112,1.87,702,gated,0,,',
-    'data row matches the column order exactly',
+    '2026-06-10T12:34:56.000Z,run-20260610T120000Z-abc123,octo/fixture,plan+build+review,412034,38112,1.87,702,gated,0,,,,',
+    'data row matches the column order exactly (trailing provider,model empty)',
   );
   assertEqual(lines[2], '', 'file ends with a newline');
 });
@@ -99,7 +99,7 @@ test('entryFromSummary: null est_usd → empty cell; no roles → empty cell', (
   );
   assertEqual(
     row,
-    '2026-06-10T00:00:00.000Z,run-20260610T120000Z-abc123,octo/fixture,,0,0,,0,success,0,,',
+    '2026-06-10T00:00:00.000Z,run-20260610T120000Z-abc123,octo/fixture,,0,0,,0,success,0,,,,',
   );
 });
 
@@ -222,11 +222,11 @@ test('record: summary.invocations → one row PER ROLE INVOCATION sharing the ru
   assertEqual(lines.length, 4, 'header + one row per invocation');
   assertEqual(
     lines[1],
-    `2026-06-10T12:00:00.000Z,${SUMMARY.runId},octo/fixture,plan,100,10,0.5,60,success,4,plan,`,
+    `2026-06-10T12:00:00.000Z,${SUMMARY.runId},octo/fixture,plan,100,10,0.5,60,success,4,plan,,,`,
   );
   assertEqual(
     lines[3],
-    `2026-06-10T12:00:00.000Z,${SUMMARY.runId},octo/fixture,review,50,5,,42,gated,7,review,`,
+    `2026-06-10T12:00:00.000Z,${SUMMARY.runId},octo/fixture,review,50,5,,42,gated,7,review,,,`,
     'null invocation est_usd → empty cell; invocation outcome recorded',
   );
   const { rows } = usage.readUsage(dir);
@@ -955,4 +955,214 @@ test('checkDailyLimits (stage 21): a verified overspend still trips daily-limit 
   );
   assertEqual(res.slug, 'daily-limit', 'known spend >= ceiling is a real trip, not doubt');
   assertEqual(res.approvable, undefined, 'no approval outranks a verified overspend');
+});
+
+// --- stage 53: provider + model columns (additive, backward-compatible) ----------
+//
+// Two new trailing columns record WHICH agent produced each row (provenance for
+// the per-role work of stage 54 / ADR-0024 and the benchmark scorecard). The
+// evolution is additive-only (§3.4): width grows to 14, older 12/11/9-column
+// files keep reading forever with provider/model defaulting to ''. The columns
+// are provenance ONLY — never summed, so no rollup number may move. A null model
+// (the claude default) writes '', never a fabricated value.
+
+test('stage 53: a 14-column row round-trips (write → read) with provider/model preserved', () => {
+  const dir = tmpDir();
+  const entry = usage.entryFromInvocation(
+    { ...SUMMARY, provider: 'codex', model: 'gpt-5-codex' },
+    {
+      role: 'build',
+      outcome: 'success',
+      tokens: { in: 100, out: 10 },
+      est_usd: null,
+      wall_secs: 60,
+      tool_calls: 5,
+    },
+    new Date('2026-06-10T12:00:00.000Z'),
+  );
+  usage.appendUsage(dir, entry);
+  const csv = fs
+    .readFileSync(path.join(dir, '.verity', 'usage.csv'), 'utf8')
+    .split('\n')
+    .filter((l) => l !== '');
+  assertEqual(csv[0], usage.HEADER, 'fresh file gets the 14-column header');
+  assertEqual(csv[0].split(',').length, 14, 'header width is 14');
+  const { rows, skipped } = usage.readUsage(dir);
+  assertEqual(skipped, 0);
+  assertEqual(rows.length, 1);
+  assertEqual(rows[0].provider, 'codex', 'provider preserved through write→read');
+  assertEqual(rows[0].model, 'gpt-5-codex', 'model preserved through write→read');
+});
+
+test('stage 53: a written row with provider codex / model gpt-5-codex reads back exactly', () => {
+  const dir = tmpDir();
+  usage.appendUsage(
+    dir,
+    usage.entryFromSummary(
+      { ...SUMMARY, provider: 'codex', model: 'gpt-5-codex' },
+      new Date('2026-06-10T00:00:00.000Z'),
+    ),
+  );
+  const { rows } = usage.readUsage(dir);
+  assertEqual(rows[0].provider, 'codex');
+  assertEqual(rows[0].model, 'gpt-5-codex');
+});
+
+test('stage 53 (backward compat): 12/11/9-column files still parse; provider/model read ""', () => {
+  // The critical guarantee. Each fixture is a LITERAL older-width CSV; none may
+  // be warned about, skipped, or read as anything but empty provider/model.
+
+  // pre-stage-53: 12 columns (…,tool_calls,role,gate — NO provider/model).
+  const dir12 = tmpDir();
+  writeCsv(dir12, [
+    'timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate',
+    '2026-06-10T01:00:00.000Z,run-1,o/r,build,100,10,0.50,60,success,7,build,unknown-cost',
+  ]);
+  const w12 = [];
+  const r12 = usage.readUsage(dir12, { warn: (m) => w12.push(m) });
+  assertEqual(w12.length, 0, 'the 12-column header is a recognized header, not a warning');
+  assertEqual(r12.skipped, 0, 'the 12-column row is valid, not malformed');
+  assertEqual(r12.rows.length, 1);
+  assertEqual(r12.rows[0].gate, 'unknown-cost', 'the 12th column (gate) still reads');
+  assertEqual(r12.rows[0].provider, '', 'missing provider reads as empty, never invented');
+  assertEqual(r12.rows[0].model, '', 'missing model reads as empty, never invented');
+
+  // pre-stage-21: 11 columns (no gate).
+  const dir11 = tmpDir();
+  writeCsv(dir11, [
+    usage.STAGE3_HEADER,
+    '2026-06-10T01:00:00.000Z,run-1,o/r,build,100,10,0.50,60,success,7,build',
+  ]);
+  const w11 = [];
+  const r11 = usage.readUsage(dir11, { warn: (m) => w11.push(m) });
+  assertEqual(w11.length, 0);
+  assertEqual(r11.skipped, 0);
+  assertEqual(r11.rows[0].role, 'build');
+  assertEqual(r11.rows[0].gate, '', 'missing gate reads as empty');
+  assertEqual(r11.rows[0].provider, '');
+  assertEqual(r11.rows[0].model, '');
+
+  // pre-stage-3: 9 columns (no tool_calls/role/gate).
+  const dir9 = tmpDir();
+  writeCsv(dir9, [
+    usage.LEGACY_HEADER,
+    '2026-06-10T01:00:00.000Z,run-1,o/r,plan+build,100,10,0.50,60,success',
+  ]);
+  const w9 = [];
+  const r9 = usage.readUsage(dir9, { warn: (m) => w9.push(m) });
+  assertEqual(w9.length, 0);
+  assertEqual(r9.skipped, 0);
+  assertEqual(r9.rows[0].tool_calls, 0);
+  assertEqual(r9.rows[0].role, '');
+  assertEqual(r9.rows[0].gate, '');
+  assertEqual(r9.rows[0].provider, '', 'a 9-column row reads provider as empty');
+  assertEqual(r9.rows[0].model, '', 'a 9-column row reads model as empty');
+});
+
+test('stage 53: rollup + rollupByRole numbers are UNCHANGED by the new columns', () => {
+  // The stage-3 rollup fixture, now carrying provider/model. Provenance must not
+  // shift a single token/cost/tool_call total, and the rollups must NOT grow a
+  // by-provider/by-model aggregate (out of scope).
+  const dir = tmpDir();
+  writeCsv(dir, [
+    usage.HEADER,
+    '2026-06-10T02:00:00.000Z,run-new,o/r,plan,100,10,0.50,60,success,4,plan,,claude,',
+    '2026-06-10T03:00:00.000Z,run-new,o/r,build,200,20,1.00,300,success,31,build,,codex,gpt-5-codex',
+    '2026-06-10T04:00:00.000Z,run-new,o/r,review,50,5,0.25,42,gated,7,review,,codex,gpt-5-codex',
+  ]);
+  const { rows, skipped } = usage.readUsage(dir);
+  assertEqual(skipped, 0, 'all three 14-column rows parse');
+  const totals = usage.rollup(rows);
+  assertEqual(totals.runs, 1, 'one run_id');
+  assertEqual(totals.tokens_in, 350);
+  assertEqual(totals.tokens_out, 35);
+  assertEqual(totals.est_usd, 1.75);
+  assertEqual(totals.tool_calls, 42);
+  assertEqual('provider' in totals, false, 'no by-provider rollup added (out of scope)');
+  assertEqual('model' in totals, false, 'no by-model rollup added (out of scope)');
+  const byRole = usage.rollupByRole(rows);
+  assertEqual(JSON.stringify(Object.keys(byRole)), '["build","plan","review"]');
+  assertEqual(byRole.build.tokens_in, 200);
+  assertEqual(byRole.build.est_usd, 1);
+  assertEqual(byRole.build.tool_calls, 31);
+  assertEqual('provider' in byRole.build, false, 'per-role groups are unchanged in shape');
+});
+
+test('stage 53: a null model writes ""; est_usd/unknown-cost/gate semantics unchanged', () => {
+  const dir = tmpDir();
+  // provider present, model null (the claude default) → empty model cell.
+  const entry = usage.entryFromSummary(
+    { ...SUMMARY, provider: 'claude', model: null, est_usd: null, gate: 'unknown-cost' },
+    new Date('2026-06-10T00:00:00.000Z'),
+  );
+  const row = usage.formatRow(entry);
+  assert(row.endsWith('claude,'), 'provider written; a null model becomes a trailing empty cell');
+  usage.appendUsage(dir, entry);
+  const { rows } = usage.readUsage(dir);
+  assertEqual(rows[0].provider, 'claude');
+  assertEqual(rows[0].model, '', 'a null model is written and read as "" — never fabricated');
+  assertEqual(rows[0].est_usd, null, 'unknown cost still UNKNOWN (null), never 0 (ADR-0008)');
+  assertEqual(rows[0].gate, 'unknown-cost', 'gate semantics untouched');
+});
+
+test('stage 53 (worker path): an invocation carrying a resolved agentCfg writes its provider/model', () => {
+  // The worker pushes agentCfg.provider/model onto every invocation (a null
+  // model → ''). record() must land them on each per-invocation row.
+  const dir = tmpDir();
+  const summary = {
+    ...SUMMARY,
+    invocations: [
+      {
+        role: 'build',
+        outcome: 'success',
+        tokens: { in: 100, out: 10 },
+        est_usd: 0.5,
+        wall_secs: 60,
+        tool_calls: 5,
+        provider: 'codex',
+        model: 'gpt-5-codex',
+      },
+      {
+        role: 'review',
+        outcome: 'gated',
+        tokens: { in: 50, out: 5 },
+        est_usd: null,
+        wall_secs: 42,
+        tool_calls: 7,
+        provider: 'codex',
+        model: 'gpt-5-codex',
+      },
+    ],
+  };
+  usage.record(dir, summary, { commit: false, now: new Date('2026-06-10T12:00:00.000Z') });
+  const { rows } = usage.readUsage(dir);
+  assertEqual(rows.length, 2);
+  for (const r of rows) {
+    assertEqual(r.provider, 'codex', 'each per-invocation row records the invocation provider');
+    assertEqual(r.model, 'gpt-5-codex', 'each per-invocation row records the invocation model');
+  }
+  // A claude-default invocation (model null) lands provider claude, model ''.
+  const dir2 = tmpDir();
+  usage.record(
+    dir2,
+    {
+      ...SUMMARY,
+      invocations: [
+        {
+          role: 'plan',
+          outcome: 'success',
+          tokens: { in: 1, out: 1 },
+          est_usd: 0.1,
+          wall_secs: 1,
+          tool_calls: 0,
+          provider: 'claude',
+          model: null,
+        },
+      ],
+    },
+    { commit: false },
+  );
+  const r2 = usage.readUsage(dir2).rows;
+  assertEqual(r2[0].provider, 'claude');
+  assertEqual(r2[0].model, '', 'a null model → "" on the row, never fabricated');
 });

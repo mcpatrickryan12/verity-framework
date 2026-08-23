@@ -1010,3 +1010,126 @@ test('restore: work that BLOCKS the switch back is reported loudly, never destro
     "the failed role's work is intact — Verity never discards it to tidy up",
   );
 });
+
+// --- 9. Stage 77: fetch the remote before the fork base is resolved -------------
+// The worker merges each stage PR on the REMOTE (`gh pr merge`) but this process
+// otherwise never fetches, so `origin/<default>` stays frozen at clone time and
+// every stage forks off a base missing its just-merged predecessors. The fix:
+// on the CREATE path, `git fetch <remote>` BEFORE the base is resolved. It is
+// best-effort — a failed fetch is a note, never a refusal — and never runs on
+// the existing-branch checkout path (re-checkout must not move a base).
+
+// Advance origin's default branch from a SIBLING clone — a predecessor merged on
+// the server after fx.dir was cloned, so fx.dir's remote-tracking ref is stale
+// until it fetches. Returns the new remote tip.
+function advanceOrigin(fx) {
+  const clone = path.join(fx.root, `pusher-${Math.random().toString(36).slice(2)}`);
+  execFileSync('git', ['clone', '-q', fx.origin, clone], { stdio: 'pipe' });
+  git(clone, ['config', 'user.email', 'pusher@example.test']);
+  git(clone, ['config', 'user.name', 'Pusher']);
+  fs.writeFileSync(path.join(clone, 'merged-predecessor.txt'), 'a just-merged PR\n');
+  git(clone, ['add', '-A']);
+  git(clone, ['commit', '-q', '-m', 'a merged predecessor PR']);
+  git(clone, ['push', '-q', 'origin', `HEAD:${fx.base}`]);
+  return git(clone, ['rev-parse', 'HEAD']).trim();
+}
+
+test('fetch (stage 77): the CREATE path refreshes origin BEFORE the base is resolved', () => {
+  const fx = fixture(BUILDER, { stages: 2 });
+  const oldRemote = git(fx.dir, ['rev-parse', `origin/${fx.base}`]).trim();
+  const remoteTip = advanceOrigin(fx);
+  assert(remoteTip !== oldRemote, 'the remote really moved on the server');
+  assertEqual(
+    git(fx.dir, ['rev-parse', `origin/${fx.base}`]).trim(),
+    oldRemote,
+    'precondition: the remote-tracking ref is still frozen (nothing fetched yet)',
+  );
+
+  const plan = gitLifecycle.plan({
+    cwd: fx.dir,
+    role: 'builder',
+    roleArgs: ['1'],
+    policy: loaded(BUILDER),
+  });
+  const provided = gitLifecycle.assertProvidable(fx.dir, plan);
+  // assertProvidable resolved the base — and the fetch it ran FIRST advanced the
+  // remote-tracking ref, so the base now points at the just-merged tip.
+  assertEqual(
+    git(fx.dir, ['rev-parse', `origin/${fx.base}`]).trim(),
+    remoteTip,
+    'the fetch refreshed origin before the base was resolved',
+  );
+  assertEqual(provided.base, `origin/${fx.base}`, 'the base is the remote default branch');
+  const started = gitLifecycle.begin(fx.dir, provided);
+  assertEqual(
+    git(fx.dir, ['rev-parse', started.branch]).trim(),
+    remoteTip,
+    'so the new stage branch forks off the freshly-fetched tip, not the stale one',
+  );
+});
+
+test('fetch (stage 77): a FETCH FAILURE still creates the branch and emits a note — never refused', () => {
+  const fx = fixture(BUILDER);
+  // Make the fetch fail WITHOUT disturbing the remote-tracking refs the clone
+  // already recorded: delete the bare origin. `git fetch origin` can no longer
+  // reach it, but refs/remotes/origin/HEAD + origin/<base> still resolve locally,
+  // so the pre-fetch behaviour is the graceful fallback.
+  const staleBase = git(fx.dir, ['rev-parse', `origin/${fx.base}`]).trim();
+  fs.rmSync(fx.origin, { recursive: true, force: true });
+
+  const notes = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => {
+    notes.push(String(chunk));
+    return true;
+  };
+  let provided;
+  try {
+    const plan = gitLifecycle.plan({
+      cwd: fx.dir,
+      role: 'builder',
+      roleArgs: ['1'],
+      policy: loaded(BUILDER),
+    });
+    provided = gitLifecycle.assertProvidable(fx.dir, plan); // must NOT throw
+  } finally {
+    process.stderr.write = orig;
+  }
+  assert(
+    notes.some((n) => n.includes('git-fetch-note')),
+    `a failed fetch emits a best-effort note, got: ${JSON.stringify(notes)}`,
+  );
+  const started = gitLifecycle.begin(fx.dir, provided);
+  assertEqual(started.created, true, 'the branch was still created — the run is not refused');
+  assertEqual(
+    git(fx.dir, ['rev-parse', started.branch]).trim(),
+    staleBase,
+    'forked off the stale-but-present base — today’s no-fetch behaviour is the fallback',
+  );
+});
+
+test('fetch (stage 77): the EXISTING-branch checkout path issues no base-moving fetch', () => {
+  const fx = fixture(BUILDER);
+  // The stage branch already exists locally — a re-dispatch checks it out, and
+  // re-checking-out must never move a base.
+  git(fx.dir, ['branch', 'feat/stage-1-core', 'HEAD']);
+  const oldRemote = git(fx.dir, ['rev-parse', `origin/${fx.base}`]).trim();
+  const remoteTip = advanceOrigin(fx);
+  assert(remoteTip !== oldRemote, 'the remote moved on the server');
+
+  const plan = gitLifecycle.plan({
+    cwd: fx.dir,
+    role: 'builder',
+    roleArgs: ['1'],
+    policy: loaded(BUILDER),
+  });
+  const provided = gitLifecycle.assertProvidable(fx.dir, plan);
+  const started = gitLifecycle.begin(fx.dir, provided);
+  assertEqual(started.created, false, 'the existing branch is re-used, not created');
+  // No fetch ran, so the remote-tracking ref is UNCHANGED — the base did not move.
+  assertEqual(
+    git(fx.dir, ['rev-parse', `origin/${fx.base}`]).trim(),
+    oldRemote,
+    'the checkout path left origin frozen — no base-moving fetch on re-dispatch',
+  );
+});

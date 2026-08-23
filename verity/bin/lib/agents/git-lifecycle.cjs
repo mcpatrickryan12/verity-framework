@@ -93,6 +93,37 @@ function firstLine(text) {
   ).trim();
 }
 
+// Refresh the remote-tracking refs from the remote before a NEW stage branch's
+// base is resolved. WHY: resolveBase forks a stage off `refs/remotes/<remote>/
+// HEAD` (i.e. `origin/main`) — correct in principle — but the worker merges
+// each stage PR on the REMOTE (`gh pr merge`) and this process otherwise never
+// fetches, so that remote-tracking ref stays FROZEN at clone time. Every stage
+// then forks off a base MISSING its just-merged predecessors and re-implements
+// them, producing a genuine content conflict at merge. A `git fetch <remote>`
+// here means the base resolved just below reflects those merges.
+//
+// Best-effort, NEVER fatal: an offline/transient fetch (or one with no upstream)
+// logs a note and proceeds with the refs as they are — the pre-fetch behaviour
+// is the graceful fallback, and a build must not be held hostage to a network
+// hiccup. Only the remote's default branch is fetched; local branches and the
+// working tree are never pruned or touched.
+function fetchBase(cwd, remote) {
+  // `-c remote.<remote>.followRemoteHEAD=never`: git 2.45+ otherwise AUTO-CREATES
+  // `refs/remotes/<remote>/HEAD` on a plain `fetch`, which would hand resolveBase
+  // a recorded default branch where the repository has none — silently changing
+  // which rung of its deterministic ladder fires (checkout-parity / refusal).
+  // We only ever want to REFRESH existing remote-tracking refs here; inventing a
+  // default-branch record is resolveBase's decision to make, never a fetch's.
+  const res = git(cwd, ['-c', `remote.${remote}.followRemoteHEAD=never`, 'fetch', remote]);
+  if (!res.ok) {
+    // Not `throw` — a failed fetch is a fallback, not a refusal (see above).
+    process.stderr.write(
+      `verity-agent-exec: git-fetch-note: could not fetch '${remote}' to refresh the stage base (${firstLine(res.stderr)}); forking off the remote-tracking refs as they are\n`,
+    );
+  }
+  return res.ok;
+}
+
 // The fail-closed refusal. Raised BEFORE the model is invoked (nothing has been
 // spent yet) and mapped by the coordinator onto exit 30 + one stderr slug line.
 function unprovidable(detail) {
@@ -233,8 +264,11 @@ function plan({ cwd, role, roleArgs = [], runId = null, policy }) {
 
 // The capability-honesty rule (ADR-0011) applied to a GRANT rather than a
 // restriction: everything the promise "Verity performs git for you" depends on
-// is checked here, before the run. Every check is a git READ — nothing is
-// mutated, so a refusal leaves the repository exactly as it was.
+// is checked here, before the run. The refusal checks are all git READS — a
+// refusal leaves the repository exactly as it was. The ONE deliberate write is
+// the best-effort `git fetch` on the CREATE path (fetchBase): it only advances
+// remote-tracking refs (never the working tree or a local branch), and is what
+// makes the base resolved below reflect just-merged predecessors.
 function assertProvidable(cwd, p) {
   if (!git(cwd, ['rev-parse', '--git-dir']).ok) {
     throw unprovidable(`${cwd} is not a git repository`);
@@ -256,6 +290,16 @@ function assertProvidable(cwd, p) {
     throw unprovidable(
       `this repository has no '${p.remote}' remote, so the stage branch could never be pushed (a branch nobody else can see is not a delivered stage)`,
     );
+  }
+  // Refresh the remote-tracking refs so a NEW stage branch forks off an
+  // `origin/<default>` that already contains its just-merged predecessors
+  // (fetchBase explains why the frozen ref is the defect). ONLY on the CREATE
+  // path: re-checking-out an existing stage branch must never move its base, so
+  // when the branch is already present we skip the fetch entirely. Best-effort —
+  // a failed fetch is a note, never a refusal, so every read below still runs.
+  const branchExists = git(cwd, ['rev-parse', '--verify', '--quiet', `refs/heads/${p.branch}`]).ok;
+  if (!branchExists) {
+    fetchBase(cwd, p.remote);
   }
   // The fork point, resolved here so an undeterminable base refuses BEFORE the
   // model runs — and never degrades to "branch off whatever HEAD is", which is
@@ -534,6 +578,7 @@ module.exports = {
   changedPaths,
   commitMessage,
   currentRef,
+  fetchBase,
   finish,
   plan,
   report,

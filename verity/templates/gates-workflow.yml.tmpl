@@ -1,0 +1,19 @@
+name: Verity gates
+# Rendered by the Verity localhost act runner (stage 87, ADR-0030) from the
+# committed single-source gate definition `.verity/gates.json` at {{sha}} —
+# generated into a temp directory for ONE run and discarded, never committed,
+# never hand-edited. Workflow YAML is NOT an independent source of gate truth
+# (ADR-0030): every step below replays one committed gate, in order, judged by
+# exit code only (ADR-0028).
+#
+# Gate commands must not depend on GitHub-only context (API calls,
+# secrets.GITHUB_TOKEN, gitleaks-action-style steps) — the definition must
+# stay runnable on every runner (ADR-0030 Consequences); a command that does
+# fails honestly under act.
+on: push
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+{{steps}}

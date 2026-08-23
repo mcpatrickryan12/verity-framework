@@ -33,6 +33,10 @@ const smoke = require('./lib/smoke.cjs');
 const deployment = require('./lib/deployment.cjs');
 const doctor = require('./lib/doctor.cjs');
 const promotion = require('./lib/promotion.cjs');
+const operator = require('./lib/operator.cjs');
+const benchmark = require('./lib/benchmark.cjs');
+const gates = require('./lib/gates.cjs');
+const gateRunners = require('./lib/gate-runners.cjs');
 
 function parseArgs(argv) {
   const positional = [];
@@ -209,6 +213,41 @@ const COMMANDS = {
   doctor(rest, flags) {
     return doctor.dispatch(rest, flags);
   },
+  // Operator snapshot (stage 47, contracts/operator-snapshot.md): a read-only
+  // projection of Verity's externalised state — `operator snapshot --json`
+  // emits exactly one compact JSON object (pipe-safe, the `next --json`
+  // convention). Net-new, worker-decoupled: removing this line disables the
+  // noun with zero lifecycle impact (kill-switch / dark-launch).
+  operator(rest, flags) {
+    return operator.dispatch(rest, flags);
+  },
+  // Benchmark harness (stage 55, ADR-0025): `benchmark provision` orchestrates
+  // the existing vision flow (identity→scaffold→git→gh) to stand up a dated
+  // throwaway fixture repo. Dark/opt-in — inert unless a valid benchmark.json
+  // with enabled:true. Additive tooling; removing this line fully disables it.
+  benchmark(rest, flags) {
+    return benchmark.dispatch(rest, flags);
+  },
+  // Local gate runner (stage 82, ADR-0029 §4): `gates run [--branch <b>]`
+  // executes the committed single-source `.verity/gates.json` against the
+  // branch head, judged by exit code ONLY (ADR-0028), and writes the
+  // SHA-pinned gate-run record (contract local-work-item v1) stage 80's
+  // snapshot driver reads; `--no-record` runs the working tree's definition
+  // where the checkout stands (CI). Red ⇒ nonzero exit (mapped in main()).
+  gates(rest, flags) {
+    return gates.dispatch(rest, flags);
+  },
+  // Gate-runner catalog (stage 88, ADR-0030): `gate-runners
+  // list|show|path|edit|ensure` administers ~/.verity/gate-runners.md — the
+  // GLOBAL named inventory of remote gate hosts (credential LOCATIONS, never
+  // secrets) that `gate_runner: remote:<name>` resolves against at preflight.
+  // Registered exactly like `deployment` (the catalog it is patterned on);
+  // net-new noun — removing this line disables the admin surface entirely,
+  // and the catalog itself is inert unless a project configures a
+  // remote:<name> runner (kill-switch by design).
+  'gate-runners'(rest, flags) {
+    return gateRunners.dispatch(rest, flags);
+  },
 };
 
 function main() {
@@ -281,6 +320,30 @@ function main() {
         emit(result, flags);
       }
       process.exitCode = doctor.exitCodeFor(result);
+      return;
+    }
+    if (noun === 'operator') {
+      // Stage 47 contract: with --json, stdout is exactly ONE compact JSON
+      // object (pipe-safe, the `next --json` convention). Read projections
+      // (snapshot/work/gates/runs/run) carry no exit semantics. Stage 50: the
+      // `act` write verb returns a result carrying a top-level `ok` — a failed
+      // act MUST exit non-zero (fail-closed), an ok act exits 0.
+      if (flags.json) {
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } else {
+        emit(result, flags);
+      }
+      if (result && typeof result.ok === 'boolean') {
+        process.exitCode = result.ok ? 0 : 1;
+      }
+      return;
+    }
+    if (noun === 'gates') {
+      // Stage 82 (ADR-0029 §4): a gate run is judged exactly as it judges its
+      // gates — by exit code. Any red gate (or refused run, via the throw
+      // path below) exits nonzero; only an all-zero run exits 0.
+      emit(result, flags);
+      process.exitCode = gates.exitCodeFor(result);
       return;
     }
     if ((noun === 'autonomy' || noun === 'usage') && flags.json) {

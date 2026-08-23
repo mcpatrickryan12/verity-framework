@@ -146,6 +146,13 @@ function fixture(permissions = RESTRICTED, opts = {}) {
   fs.writeFileSync(path.join(dir, '.github', 'workflows', 'ci.yml'), 'name: ci\n');
   fs.mkdirSync(path.join(dir, '.verity'), { recursive: true });
   fs.writeFileSync(path.join(dir, '.verity', 'autonomy.yml'), 'mode: manual\n');
+  // `.verity/identity.json` is a required READ context (issue #171): the plan
+  // role's `verity identity get` reads it. It is present-and-readable in the
+  // shaped workspace, yet a WRITE to it is still gate-rejected.
+  fs.writeFileSync(
+    path.join(dir, '.verity', 'identity.json'),
+    `${JSON.stringify({ repo: 'verity/example', locked_at: '2026-01-01T00:00:00Z' }, null, 2)}\n`,
+  );
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'src', 'app.txt'), 'baseline\n');
   fs.writeFileSync(path.join(dir, '.verity-stub.json'), JSON.stringify({ actions: [] }));
@@ -241,10 +248,17 @@ function loaded(permissions) {
 
 // --- 1. the disposable shaped workspace -----------------------------------------
 
-test('workspace: the role runs in a DISPOSABLE workspace where protected roots are physically ABSENT', () => {
+test('workspace: the role runs in a DISPOSABLE workspace — .github ABSENT, .verity PRESENT read-context', () => {
   const fx = fixture();
   const res = run(fx, {
-    probePaths: ['.github', '.github/workflows/ci.yml', '.verity', 'src/app.txt', 'commands'],
+    probePaths: [
+      '.github',
+      '.github/workflows/ci.yml',
+      '.verity',
+      '.verity/identity.json',
+      'src/app.txt',
+      'commands',
+    ],
   });
   assertEqual(res.code, 0, `clean tier-2 run completes (stderr: ${res.stderr})`);
   assertLive(fx, res.runId, 'workspace shaping');
@@ -255,10 +269,17 @@ test('workspace: the role runs in a DISPOSABLE workspace where protected roots a
   assertEqual(seen.spawnedInCd, true, 'and the child process was spawned there too');
   assert(seen.cd !== fx.dir, 'the model never runs in the real checkout');
 
-  // The protected roots are not "denied" — they are NOT THERE.
+  // `.github/` is not a read context — it is NOT THERE (topological absence).
   assertEqual(seen.sees['.github'], false, '.github is absent from the workspace');
   assertEqual(seen.sees['.github/workflows/ci.yml'], false, 'and so is everything under it');
-  assertEqual(seen.sees['.verity'], false, '.verity is absent from the workspace');
+  // `.verity/` is a required READ context (issue #171): PRESENT and readable,
+  // yet still gate-protected on WRITE (proven by the merge-back tests below).
+  assertEqual(seen.sees['.verity'], true, '.verity is PRESENT as a read-context');
+  assertEqual(
+    seen.sees['.verity/identity.json'],
+    true,
+    'and `verity identity get` can read .verity/identity.json — no self-inflicted recreate',
+  );
   // Everything the role IS allowed to work on is present and complete.
   assertEqual(seen.sees['src/app.txt'], true, 'ordinary source is present');
   assertEqual(seen.sees.commands, true, 'the role can read everywhere it is allowed');
@@ -266,6 +287,73 @@ test('workspace: the role runs in a DISPOSABLE workspace where protected roots a
   // The real checkout still has them, untouched.
   assertEqual(read(fx, '.github/workflows/ci.yml'), 'name: ci\n', 'real checkout intact');
   assertEqual(read(fx, '.verity/autonomy.yml'), 'mode: manual\n', 'real checkout intact');
+});
+
+test('read-context: a run that only READS .verity/identity.json merges clean (issue #171 root cause)', () => {
+  // The exact shape of the live codex D failure: the role reads
+  // `.verity/identity.json` (as `verity identity get` does) and writes only its
+  // own allowed work. Because `.verity/` is now PRESENT, the read succeeds and
+  // NOTHING under `.verity/**` is touched — so the gate finds no protected-path
+  // write and the run merges clean, instead of being lost to a recreated file.
+  const fx = fixture();
+  const res = run(fx, {
+    probePaths: ['.verity/identity.json'],
+    actions: [{ write: 'src/app.txt', text: 'work that reads identity first\n' }],
+  });
+  assertEqual(
+    res.code,
+    0,
+    `a read-only touch of .verity does not fail the run (stderr: ${res.stderr})`,
+  );
+  assertLive(fx, res.runId, 'read-context read');
+  assertEqual(probe(fx, res.runId).sees['.verity/identity.json'], true, 'the read succeeded');
+  const obj = resultObject(res);
+  assertEqual(obj.outcome, 'success', 'a pure read of .verity is not a protected-path write');
+  assert(!('containment_rejected' in obj), 'nothing rejected — no self-inflicted .verity write');
+  assertEqual(
+    JSON.stringify(obj.containment_merged),
+    '["src/app.txt"]',
+    'only the allowed work crossed',
+  );
+  // `.verity/identity.json` in the real checkout is byte-for-byte unchanged.
+  assert(read(fx, '.verity/identity.json').includes('2026-01-01T00:00:00Z'), 'identity untouched');
+});
+
+test('read-context: a WRITE under .verity/** is STILL rejected protected-path (the gate is the teeth)', () => {
+  // `.verity/` is present for reading, but a genuine write — modifying the
+  // tracked identity.json OR adding a new file — shows in `git status` and the
+  // gate rejects it exactly as before (protectedRoots still holds `.verity`).
+  const fx = fixture();
+  const res = run(fx, {
+    actions: [
+      { write: '.verity/identity.json', text: 'tampered\n' },
+      { write: '.verity/stolen.txt', text: 'exfil\n' },
+      { write: 'src/app.txt', text: 'legitimate work in the same run\n' },
+    ],
+  });
+  assertLive(fx, res.runId, '.verity write rejection');
+  assertEqual(res.code, 20, `a .verity write fails the run (stderr: ${res.stderr})`);
+  const obj = resultObject(res);
+  assertEqual(obj.outcome, 'failed', 'the role claimed success — the gate overrides it');
+  assert(obj.error.includes('protected-path'), `rejected as protected-path (${obj.error})`);
+  assert(obj.error.includes('NOTHING was propagated'), 'and nothing crossed');
+  assertEqual(
+    JSON.stringify(obj.containment_rejected.map((r) => `${r.path}:${r.reason}`).sort()),
+    '[".verity/identity.json:protected-path",".verity/stolen.txt:protected-path"]',
+    'both a modification and an addition under .verity are rejected protected-path',
+  );
+  // The real repository is exactly as it was — including the same run's edit.
+  assert(read(fx, '.verity/identity.json').includes('2026-01-01T00:00:00Z'), 'identity untampered');
+  assert(
+    !fs.existsSync(path.join(fx.dir, '.verity', 'stolen.txt')),
+    'the added file never crossed',
+  );
+  assertEqual(
+    read(fx, 'src/app.txt'),
+    'baseline\n',
+    "ALL-OR-NOTHING: the run's legit edit stayed too",
+  );
+  assertEqual(git(fx.dir, ['status', '--porcelain']).trim(), '', 'real checkout wholly untouched');
 });
 
 test('workspace: sited under the Verity state root, NEVER under TMPDIR (spike F5)', () => {
@@ -636,4 +724,47 @@ test('workspace: prepare/merge/cleanup unit cycle against a real repository', ()
     '{"removed":false,"retained":false}',
     'cleanup of nothing is not an error',
   );
+});
+
+test('read-context: readContextPaths shrinks `withheld` but leaves `protectedRoots` FULL (issue #171)', () => {
+  const fx = fixture();
+  const dir = path.join(fx.home, 'unit-ws-readctx');
+  const ws = workspace.prepare({
+    cwd: fx.dir,
+    dir,
+    policy: loaded(RESTRICTED),
+    protectedPaths: codex.PROTECTED_WRITE_PATHS,
+    readContextPaths: codex.READ_CONTEXT_PATHS,
+  });
+  // The topological layer shrinks: `.verity` is a read-context, so it is NOT
+  // withheld — it is checked out and readable.
+  assertEqual(JSON.stringify(ws.withheld), '[".github"]', 'only .github is absented');
+  assert(fs.existsSync(path.join(dir, '.verity', 'identity.json')), '.verity is PRESENT to read');
+  assert(!fs.existsSync(path.join(dir, '.github')), '.github stays absent');
+  // The gate (the teeth) is UNCHANGED: protectedRoots is still the full list.
+  assertEqual(
+    JSON.stringify(ws.protectedRoots),
+    '[".github",".verity"]',
+    'the gate still rejects writes to BOTH roots — enforcement moved, not weakened',
+  );
+  assertEqual(
+    JSON.stringify(workspace.changes(ws)),
+    '[]',
+    'a fresh read-context workspace is clean',
+  );
+
+  // A WRITE under the present-but-protected .verity root is caught by `git
+  // status` (it is tracked/present now, not scanned) and rejected by the gate.
+  fs.writeFileSync(path.join(dir, '.verity', 'identity.json'), 'tampered\n');
+  fs.writeFileSync(path.join(dir, '.verity', 'added.txt'), 'new\n');
+  fs.writeFileSync(path.join(dir, 'src', 'app.txt'), 'ok\n');
+  const verdict = workspace.merge(ws, loaded(RESTRICTED));
+  assertEqual(verdict.merged.length, 0, 'ALL-OR-NOTHING: a rejected .verity write blocks the run');
+  assertEqual(
+    JSON.stringify(verdict.rejected.map((r) => `${r.path}:${r.reason}`).sort()),
+    '[".verity/added.txt:protected-path",".verity/identity.json:protected-path"]',
+    'both the modification and the addition are rejected protected-path',
+  );
+  assert(read(fx, '.verity/identity.json').includes('2026-01-01T00:00:00Z'), 'real repo untouched');
+  workspace.cleanup(ws);
 });

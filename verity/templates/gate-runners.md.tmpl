@@ -1,0 +1,28 @@
+# Your Verity gate runners
+
+> **Global to YOU, across every project.** This is your private inventory of the
+> machines that can EXECUTE a project's committed gate definition when its
+> `.verity/autonomy.yml` says `gate_runner: remote:<name>` (ADR-0030). Project
+> config references the NAME only — host details, users, and IPs stay here,
+> outside every repo.
+>
+> ⚠️ **Reference credential LOCATIONS, never paste secrets.** Point at a key
+> file *path* or an `~/.ssh/config` entry *name* — never an actual key,
+> password, or token. This file lives at `~/.verity/gate-runners.md`; it is NOT
+> in any repo, but treat it as sensitive anyway.
+>
+> Edit it any time with `verity gate-runners edit` (or open the path printed by
+> `verity gate-runners path`). Add one `## <name> — <Title>` section per runner
+> — names may use letters, digits, `.`, `_`, `-` (exactly the charset
+> `gate_runner: remote:<name>` accepts) — and set `- **status:** active` once
+> it is real (the sample below is `example` — replace or delete it; an example
+> entry never resolves as a real host). Each runner needs Docker (daemon
+> running) and nektos/act installed; `verity doctor` probes both over your
+> existing SSH context and never reads or logs credential contents.
+
+## gpu-box — LAN GPU workstation (example — edit or delete)
+- **status:** example
+- **host:** `<hostname-or-ssh-config-alias>`
+- **user:** `<remote-user>` — omit this line when the SSH-config alias carries it
+- **access:** `ssh <user>@<host>` — key at `~/.ssh/<your-key>` (location only)
+- **notes:** needs Docker + act installed; only reachable on the LAN / VPN.

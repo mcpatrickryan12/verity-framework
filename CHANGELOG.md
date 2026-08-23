@@ -1,5 +1,108 @@
 # Changelog
 
+## 1.3.0
+
+### Features
+- local-mode provision/run — fixture-A build-through with zero GitHub API calls (stage 83, ADR-0029) (dev#235)
+- local git lifecycle — bare-origin provision + engine-performed local merge (ADR-0029 §1/§3) (dev#233)
+- local work-item store + snapshot driver (contract local-work-item v1) (dev#232)
+- delivery-substrate seam — substrate github|local resolved once (ADR-0029) (dev#231)
+- autonomous-run defaults (unknown_cost_behavior, mode) + seed-verify surfaces worker output (dev#167)
+- seed-identity override (seed_token_env) + repo_visibility (dev#165)
+
+### Fixes
+- fixture A tells the planner there is no recurring intake — full acceptance coverage in the initial backlog (dev#224)
+- fork `stage branch` off the fetched default-branch base (stage 78) (dev#223)
+- read the default branch as a string (Buffer crashed provision) (dev#221)
+- git fetch origin before the explicit set-head (build-through base) (dev#220)
+- record origin/HEAD with EXPLICIT set-head, not --auto (stage 77 build-through) (dev#219)
+- present .verity/ as a read-context in the tier-2 workspace, keep it gate-protected (dev#171) (dev#175)
+- neutralize $verity-<role> handoff tokens in the headless render (dev#170) (dev#174)
+- wait for the seeded request to be visible to the scanner before the plan tick (dev#169)
+- provision must ensure the Verity labels on the fresh repo (dev#163)
+- gh repo create needs --private non-interactively; surface step stderr (dev#161)
+- datedSlug must lowercase the fixture id (identity-lock rejects uppercase) (dev#159)
+- refuse an injectable repo and a breaker target the worker cannot see (stage 52, refs dev#135) (dev#136)
+
+### Chores
+- PROM-0001 — v1.2.0 published to npm, registry shasum matches record (refs dev#107)
+- record PROM-0001 — finalize v1.2.0 released (prod tag v1.2.0)
+- record PROM-0001 — propose v1.2.0 (prod PR 1)
+
+### Other
+- [stage 90] Config hygiene: substrate schema text tells the truth, worker clears stale VERITY_SUBSTRATE on github runs, catalog SSH targets refuse option-shaped values (dev#248)
+- plan(stage-90): config-hygiene chore batch — truthful substrate schema text, VERITY_SUBSTRATE clear on non-local runs, option-shaped SSH target refusal — spec + assessment (rejects the already-fixed engine-copy item, refs stage-35)
+- [stage 89] Remote act runner: judged branch pushed to a runner-side clone over SSH, act executes there, sha-honest record, no implicit fallback (dev#246)
+- [stage 88] Gate-runner catalog: gate-runners.md named remote entries, locations never secrets, doctor probes the configured runner (dev#245)
+- [stage 87] Localhost act runner: engine invokes act on the scaffolded workflow in Docker, recorded with runner localhost (dev#244)
+- [stage 86] Gate-runner seam: gate_runner direct-localhost-remote-github-actions resolved once, absent means today byte-identical (dev#243)
+- plan(stage-86..89): gate-runner axis — direct/localhost/remote:<name>/github-actions — ADR-0030, specs + assessment (refs dev#239-dev#242)
+- [stage 85] Real-model local runs: substrate-aware worker GitHub sites, honest fixture gate, recorded fixture-A smoke (dev#238)
+- [stage 84] Operator contracts degrade honestly on the local substrate (dev#237)
+- plan(stage-85): real-model local runs — substrate-aware worker gh sites + honest fixture gate + recorded smoke — spec + assessment addendum (refs stage-83 review carry-forwards)
+- [stage 82] Local gate runner: single-source gate definition, exit-code judged, SHA-pinned gate-run records (dev#234)
+- plan(stage-79..84): Verity Fresh step 1 — delivery-substrate seam + local mode — ADR-0028/0029, contract local-work-item v1, design, specs + assessment (refs dev#225-dev#230)
+- plan(stage-78): base-fresh stage branch creation — spec + assessment (refs dev#222)
+- [stage 77] Reliable build-through — fetch origin before branch cut + serialize stage builds under auto-merge (dev#218)
+- plan(stage-77): reliable build-through — fetch origin before branch cut + serialize under auto-merge — spec + assessment
+- [stage 76] build role must not self-park at review:merge — coerce gated-handoff to success (dev#216)
+- plan(stage-76): build role must not self-park at review:merge — spec + assessment
+- [stage 75] benchmark writeVariant plumbs review.trust for build-through runs (dev#214)
+- plan(stage-75): benchmark writeVariant plumbs review.trust for build-through — spec + assessment
+- benchmark(fixture A): re-theme to Star Lab physics-puzzle game (dev#212)
+- [stage 74] Bump max-turns default 40 → 80 (headroom for dev#202) (dev#211)
+- [stage 73] Retire the plan trigger once stages exist — worker re-plans a verity:request every tick, ~54% of a heavy run wasted (fixes dev#202 core) (dev#209)
+- plan(stage-73): retire the plan trigger once stages exist — worker re-plans every tick (fixes dev#202 core)
+- [stage 72] Plan guidance must not direct the build to establish a CI gate (fixes stage-71 regression) (dev#207)
+- [stage 71] Plan role emits a thin initial backlog, not the full architecture (fixes dev#202) (dev#205)
+- plan(stage-71): plan role emits a thin initial backlog, not the full architecture (fixes dev#202)
+- docs(benchmark): append fixture A results + grading (overturns 3 fixture-C signals)
+- docs(benchmark): consolidated findings — runs → defects → fixes → statistics
+- [stage 70] Make the CI-registration grace tolerant of clock skew (fixes dev#198) (dev#200)
+- plan(stage-70): make the CI-registration grace tolerant of clock skew
+- [stage 69] Thread now into operator.cjs next callers so the CI grace applies via the operator snapshot (fixes dev#195) (dev#197)
+- plan(stage-69): thread now into all next.decide/decideStage callers (CI grace via operator snapshot)
+- [stage 68] CI-registration grace before ci:unverified gates (ADR-0027, fixes dev#192) (dev#194)
+- plan(stage-68): CI-registration grace before ci:unverified gates (ADR-0027)
+- [stage 67] Provision stage work-item labels + surface reconcile failures (fixes dev#188) (dev#191)
+- plan(stage-67): provision stage work-item labels + surface reconcile failures
+- [stage 66] Make plan-role work-item registration non-fatal / worker-owned (ADR-0026 cutover, fixes dev#185) (dev#187)
+- plan(stage-66): make plan-role work-item registration non-fatal / worker-owned (ADR-0026 cutover)
+- [stage 65] Reconcile plan work-items on a failed (not only successful) plan outcome (fixes dev#182) (dev#184)
+- plan(stage-65): reconcile plan work-items on a failed (not only successful) plan outcome
+- [stage 64] Wire agent.reconcile_work_items → --reconcile-work-items in the worker plan dispatch (ADR-0026) (dev#181)
+- plan(stage-64): wire agent.reconcile_work_items → --reconcile-work-items in the worker plan dispatch
+- [stage 63] Worker-owned work-item creation: reconcile stage-instructions to GitHub issues after plan (ADR-0026, dev#176) (dev#179)
+- plan(stage-63): worker-owned work-item creation — codex plan can't create work-items under containment
+- docs(benchmark): live-run progress report (session 2026-08-10) (dev#173)
+- docs(benchmark): live-run runbook — pre-flight, config, trigger, guardrails (dev#157)
+- [stage 62] author benchmark fixture B — small decided already-decomposed project (build-only) (dev#156)
+- [stage 61] benchmark build-only run mode — skip plan for an in-flight fixture, assert build-drivable backlog, drive build (dev#155)
+- [stage 60] benchmark provision replay — an in-flight fixture commits its stage backlog and provision regenerates the [stage N] issues (dev#154)
+- [stage 59] author benchmark fixtures A (heavy greenfield) and C (light ask) (refs dev#148) (dev#150)
+- [stage 58] benchmark fixture seed-set — provision commits a fixture's architecture + ADR docs (refs dev#147) (dev#149)
+- plan(stage-58/59): benchmark fixtures A (heavy) & C (light) — seed-set enabler + fixture content (ADR-0025)
+- [stage 57] benchmark seed asserts plannability from the worker's plan tick (fixes dev#145) (dev#146)
+- plan(stage-57): benchmark seed asserts plannability post-seed — fail-closed on no-self-feeding empty (fixes dev#145)
+- [stage 56] benchmark run — drive the fixture pipeline and collect the scorecard (refs dev#142) (dev#144)
+- [stage 55] benchmark harness skeleton — config + provision a dated fixture repo (refs dev#141) (dev#143)
+- plan(stage-55/56): benchmark harness skeleton + Repo D (ADR-0025)
+- docs(adr-0024): Accepted — per-role agent config shipped (stages 53/54 merged)
+- [stage 54] per-role agent config — provider/model override map resolved once per run (refs dev#138) (dev#140)
+- [stage 53] usage ledger records provider and model per row (refs dev#137) (dev#139)
+- plan(stage-53/54): per-role agent config — ledger provenance + per-role provider/model (ADR-0024)
+- plan(stage-52): operator act must refuse an injectable repo and a breaker target the worker cannot see — spec + assessment (refs dev#135)
+- [stage 51] verity operator policy|usage|diagnostics --json — completes the operator surface (refs dev#133) (dev#134)
+- plan(stage-51): verity operator policy|usage|diagnostics --json — freeze operator-inspect contract (completes the operator surface) — spec + assessment (refs dev#133)
+- [stage 50] verity operator act — the Console write side, no new authority (refs dev#131) (dev#132)
+- plan(stage-50): verity operator act — freeze operator-act contract, the Console write side (no new authority) — spec + assessment (refs dev#131)
+- [stage 49] verity operator runs|run <id> --json — the Console Runs view (refs dev#129) (dev#130)
+- plan(stage-49): verity operator runs|run <id> --json — freeze operator-run contract (Console Runs view) — spec + assessment (refs dev#129)
+- [stage 48] verity operator gates|work --json — the Console read side (refs dev#127) (dev#128)
+- plan(stage-48): verity operator gates|work --json — freeze operator-gate contract (Console read side) — spec + assessment (refs dev#127)
+- [stage 47] verity operator snapshot --json — the Console keystone (refs dev#125) (dev#126)
+- plan(stage-47): verity operator snapshot --json — freeze operator-snapshot contract (Console keystone) — spec + assessment (refs dev#125)
+
 ## 1.2.0
 
 ### Features

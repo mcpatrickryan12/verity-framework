@@ -152,8 +152,42 @@
         "containment_tier": {
           "description": "ADDITIVE, DEFAULT-ABSENT (stage 14, ADR-0011). Which enforcement tier the worker demands of every codex dispatch. Absent = tier 1: credential stripping plus mandatory post-run invariants, which catch a containment violation AFTER it happened and revert what is safely revertible — adequate for supervised/trust-0. 2 = additionally run each role in a DISPOSABLE SHAPED WORKSPACE (paths the role may not touch are physically absent) with a GATED MERGE-BACK deciding what propagates into the real repository, making the violation impossible to propagate. UNATTENDED codex autonomy (mode: autonomous) is REFUSED below 2 (exit 30 containment-tier-required). Codex-only — claude has no containment tiers.",
           "enum": [1, 2]
+        },
+        "roles": {
+          "description": "ADDITIVE, DEFAULT-ABSENT (stage 54, ADR-0024). Optional per-role override map: keys are the roles the worker dispatches (build|plan|review), values are PARTIAL agent configs (provider/model plus the codex knobs) validated with the SAME enums as this block. Resolved ONCE at run start and FROZEN by the worker (never re-read mid-run), with containment enforced per role — a per-role codex override still requires tier 2 under mode: autonomous. Overrides may only NARROW a role's sandbox/approval relative to the base. Absent ⇒ byte-identical to a worker-wide agent config (the feature's kill-switch). An unknown role key is a load error (fail closed).",
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": { "enum": ["build", "plan", "review"] },
+          "patternProperties": {
+            "^(build|plan|review)$": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "provider": { "enum": ["claude", "codex"] },
+                "model": { "type": ["string", "null"] },
+                "sandbox": { "enum": ["read-only", "workspace-write", null] },
+                "approval": { "enum": ["untrusted", "on-request", "never", null] },
+                "acknowledged_enforcement_gaps": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                },
+                "containment_tier": { "enum": [1, 2] }
+              }
+            }
+          }
         }
       }
+    },
+    "substrate": {
+      "description": "ADDITIVE, DEFAULT-ABSENT (stage 79, ADR-0029). Which delivery substrate the run targets. Resolved ONCE at run start onto the effective policy and frozen for the run (the ADR-0024 agent-block pattern): absent resolves to 'github' — byte-identical engine behavior to every pre-stage-79 policy, and no default is ever written into provisioned files (absence is the kill-switch). An unknown value is a fail-closed load error naming the key and its allowed values — never a silent default. 'local' EXECUTES as of stage 83: the stage-79 refusal is lifted — the local substrate driver landed across stages 80–85 (record store + snapshot acquirer, bare-origin git lifecycle with the engine-performed merge, SHA-pinned gate runner, substrate-aware worker gh sites) and a local run proceeds end-to-end with zero GitHub API calls; the worker's assertSubstrateSupported belt still refuses any value outside the enum — the engine never proceeds half-driven.",
+      "enum": ["github", "local"]
+    },
+    "gate_runner": {
+      "description": "ADDITIVE, DEFAULT-ABSENT (stage 86, ADR-0030). WHERE the committed gate definition executes — orthogonal to 'substrate' (where truth lives). Values: the literals 'direct' (the stage-82 engine-spawned runner on this machine), 'localhost' (act in Docker on this machine), 'github-actions' (CI check rollups on a pushed branch — the github substrate's native oracle), or 'remote:<name>' (act over SSH on a host named in the gate-runner catalog; <name> is non-empty and catalog-name-safe). Resolved ONCE at policy load onto the effective policy and frozen for the run: absent resolves to the substrate's native runner — 'direct' on substrate 'local', 'github-actions' on substrate 'github' — byte-identical to every pre-stage-86 policy, and no default is ever written into provisioned files (absence is the kill-switch). An unknown value (including 'remote:' with an empty or unsafe name) is a fail-closed load error naming the key and its allowed values — never a silent default. Rejected combinations, refused fail-closed at load: substrate 'local' + gate_runner 'github-actions' (it presumes a pushed GitHub branch the substrate says does not exist); substrate 'github' + any non-'github-actions' runner (not supported in v1 — admitting it later is additive). 'localhost' EXECUTES as of stage 87: the engine renders a gates workflow from the committed .verity/gates.json at the pinned sha and runs it under nektos/act in Docker on this machine, judged by act's exit code only; a machine that cannot serve it (Docker binary/daemon or act absent, act version unparseable) refuses fail-closed at preflight — NO record, the branch stays UNKNOWN, never a silent degradation to 'direct'. 'remote:<name>' EXECUTES as of stage 89: the name resolves against the ~/.verity/gate-runners.md catalog (a typo is a fail-closed CONFIG error naming the catalog path and known entries), the pinned sha is pushed to a Verity-owned runner-side clone over the operator's existing SSH context (BatchMode, prompt-free; auth never read or logged), and the same rendered workflow runs under act in Docker there, judged by act's exit code only — the record carries the catalog NAME only, never host, user, or key paths. An unreachable or unprovisionable runner (SSH down, remote Docker/act absent, runner-side sha mismatch, wall-clock timeout) refuses fail-closed at preflight or before the record — NO record, the branch stays UNKNOWN, and the engine never silently executes on a different runner than configured (no fallback chains in v1).",
+      "anyOf": [
+        { "enum": ["direct", "localhost", "github-actions"] },
+        { "type": "string", "pattern": "^remote:[A-Za-z0-9._-]+$" }
+      ]
     }
   }
 }

@@ -309,15 +309,18 @@ If you see that note, you have two supported paths:
 ## Usage & cost tracking
 
 Every run appends one row **per role invocation** to `.verity/usage.csv`
-(`timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate`),
+(`timestamp,run_id,repo,roles,tokens_in,tokens_out,est_usd,wall_secs,outcome,tool_calls,role,gate,provider,model`),
 all rows of a run sharing its `run_id`, and commits them (`commit_usage: true`
 by default). `gate` is the human gate the *run* ended paused at, if any — the
 same value on every row of the run; it is how the startup breaker can tell an
 unknown-cost run that already asked a human (parked at the `unknown-cost`
 gate) from unknown spend that slipped through ungated. Pre-existing ledgers
 keep working: the schema evolves additively-only, so old 9-column rows (one
-per run, no `tool_calls`/`role`) and 11-column rows (no `gate`) parse and roll
-up alongside new ones without migration. Inspect with:
+per run, no `tool_calls`/`role`), 11-column rows (no `gate`) and 12-column rows
+(no `provider`/`model`) parse and roll up alongside new ones without migration.
+`provider`/`model` record which agent produced each row (provenance only —
+never summed); an unknown value, including a null model, reads as empty.
+Inspect with:
 
 ```bash
 verity usage --days 7            # runs, tokens, est USD, tool calls, outcomes histogram
@@ -434,6 +437,40 @@ stage is green, so it does not pretend either way. Approving the gate
 advances to `review`, and the merge itself is still gated, because merging
 requires a *verified* green reading that an unchecked PR can never produce.
 
+### Registration grace (a just-opened PR is not a no-CI repo)
+
+An empty check rollup has **two** indistinguishable causes: (a) the repository
+has no CI configured — the genuine "cannot verify" case the gate is for — and
+(b) GitHub has **not yet registered** the checks for a *just-opened* PR (a race
+of a few seconds to tens of seconds between opening the PR and Actions reporting
+its check runs). A fast worker hits (b) routinely: it evaluates `verity next`
+seconds after opening the PR, sees the empty rollup, gates `ci:unverified`, and
+parks a perfectly healthy stage for a human — CI goes green moments later but the
+stage never reaches review (issue #192; confirmed live 2026-08-11 on Codex
+fixture D — checks started 7–18s *after* the evaluation).
+
+So `next.decide` applies a bounded **CI-registration grace**
+(`CI_REGISTRATION_GRACE`, default 90s) *at the gate decision only* — **not** to
+the CI-green model. When a PR that would gate `ci:unverified` was opened within
+the grace (its `createdAt`, stamped by `ledger.fetchSnapshot`, is younger than
+the window), the stage reports **`waiting_for_ci`** instead: a non-terminal
+"CI in flight" status — no `awaiting-approval` label, no human park, no model
+run. The next evaluation re-reads the now-registered checks. Once the PR is
+**older** than the grace with a **still-empty** rollup, it becomes the genuine
+`ci:unverified` gate exactly as before — the no-CI case is preserved, merely
+delayed by the grace.
+
+The grace **defers the gate; it never advances a stage to review or merge.**
+`waiting_for_ci` is not green, so review/merge still require a verified-green
+rollup — `rollupState`/`ciStateOf` are unchanged (empty ⇒ unknown ⇒ never
+green). It is **fail-closed**: a PR with no `createdAt` (an old or injected
+snapshot) gates exactly as today — "no timestamp" is never read as "recent".
+The clock is injected (`opts.now`, defaulted to `Date.now()` only at the
+outermost caller), so the decision stays pure and deterministic in tests. The
+benchmark drive loop treats `waiting_for_ci` as "keep driving" and takes a small
+bounded wait between such ticks so it does not spin its tick budget while CI
+registers.
+
 If your repository legitimately has no CI and you do not want that pause every
 time, opt in explicitly:
 
@@ -542,3 +579,58 @@ is not an effect and never will be: the trust ladder stays the only merge path.
 Claude (uncontained) dispatches are unaffected — the flag is rejected for the
 claude driver rather than silently ignored, its prompts render byte-identically,
 and its harness keeps performing its own GitHub reads.
+
+## Local substrate gates (`.verity/gates.json`)
+
+> Stage 82 (ADR-0029 §4). **Dark today:** the worker still refuses
+> `substrate: local` at startup (the stage-79 seam's fail-closed placeholder);
+> the runner, the record format, and the scaffolded CI consumption below are
+> live as engine surface and land fully when the local substrate flips on.
+
+On the **local delivery substrate** (`substrate: local` in
+`.verity/autonomy.yml`, ADR-0029) there is no GitHub CI to answer "is this
+branch green?". The answer comes instead from a **committed, single-source
+gate definition** executed by the engine:
+
+```json
+{
+  "schema": 1,
+  "gates": [
+    { "name": "test", "command": "npm test" },
+    { "name": "lint", "command": "npx biome ci ." }
+  ]
+}
+```
+
+- **Location:** `.verity/gates.json`, committed to the repo.
+- **Ordered:** gates run top to bottom and **stop at the first failure** —
+  gates that never ran are simply absent from the run's record (the record is
+  red anyway via its nonzero entry).
+- **Exit-code judged only** (the ADR-0028 test-honesty invariant): each
+  command runs with inherited stdio — output is never piped, never parsed. A
+  gate that prints `PASS` and exits 1 is a **failure**.
+- **Absent ⇒ UNKNOWN, never green:** no definition, an unreadable one, or an
+  empty gate list refuses the run and writes **no record** — the branch reads
+  `ci:unverified` and gates, exactly as an unchecked PR does today. There is
+  no default gate list.
+
+`verity gates run [--branch <branch>]` executes the definition **committed at
+the branch head** and writes the SHA-pinned gate-run record
+`.verity/gate-runs/<branch-slug>.json` (contract `local-work-item` v1) that
+the local snapshot driver reads. The record claims exactly the head the gates
+ran against: a dirty working tree, a head that moves mid-run, or gates that
+modify tracked files all **refuse the record** (fail closed), and a record
+whose `sha` no longer equals the branch head reads UNKNOWN — staleness is
+detectable by SHA alone. The record is committed on the default branch (never
+on the branch it judges, which would immediately stale it). On the local
+substrate the worker runs this automatically after a build role completes a
+stage branch — where the GitHub path would wait on CI checks.
+
+`verity gates run --no-record` runs the working tree's definition where the
+checkout stands and reports by exit code only (no record) — this is what CI
+does: the **scaffolded workflow's `gates` job executes the same definition**
+via the committed `.verity/run-gates.cjs`, so graduation-day CI replays the
+commands that were green locally, and "tests exist but CI never runs them"
+(the issue-#203 defect class) is impossible by construction. With no
+definition the job **fails loudly with instructions** — never a silently
+green empty job.

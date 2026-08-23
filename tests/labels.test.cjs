@@ -72,40 +72,62 @@ function withStubGh(initialLabels, fn, mode = 'online') {
   }
 }
 
-test('vocabulary is exactly the 8 SKETCH §1 labels (gh-style colors)', () => {
-  assertEqual(labels.LABELS.length, 8);
+test('vocabulary: 8 verity:* workflow labels + 4 stage work-item labels (gh-style colors)', () => {
+  // Stage 67 (#188): the set grew from the 8 verity-namespaced workflow labels
+  // to also carry the 4 BARE stage work-item labels stage.issueFor attaches.
+  assertEqual(labels.LABELS.length, 12);
   for (const l of labels.LABELS) {
-    assert(l.name.startsWith('verity:'), `${l.name} must be verity-namespaced`);
     assert(/^[0-9a-f]{6}$/.test(l.color), `${l.name} color must be 6-digit lowercase hex, no #`);
     assert(l.description.length > 0, `${l.name} needs a description`);
   }
+  const verity = labels.LABELS.filter((l) => l.name.startsWith('verity:'));
+  assertEqual(verity.length, 8, 'the 8 verity-namespaced workflow labels');
+  const workItem = labels.LABELS.filter((l) => !l.name.startsWith('verity:')).map((l) => l.name);
+  assertEqual(
+    JSON.stringify(workItem.sort()),
+    JSON.stringify(['bug', 'chore', 'feature', 'needs-triage']),
+    'the 4 bare work-item labels match stage.issueFor `[type, needs-triage]`',
+  );
   const req = labels.LABELS.find((l) => l.name === 'verity:request');
   assertEqual(req.color, '0e8a16');
 });
 
-test('fresh repo: ensureLabels creates all 8 with color + description', () => {
+test('fresh repo: ensureLabels creates all 12 with color + description', () => {
   withStubGh([], (s) => {
     const r = labels.ensureLabels(s.dir);
     assertEqual(r.ok, true);
-    assertEqual(r.created.length, 8);
+    assertEqual(r.created.length, 12);
     assertEqual(r.updated.length, 0);
     const store = s.read();
-    assertEqual(store.length, 8);
+    assertEqual(store.length, 12);
     const open = store.find((l) => l.name === 'verity:circuit-open');
     assertEqual(open.color, '000000');
     assertEqual(open.description, 'Budget/safety breaker tripped; worker halts');
+    // Stage 67 (#188): the stage work-item labels are provisioned too, so the
+    // worker reconcile / plan agent `gh issue create` no longer fails closed.
+    for (const name of ['feature', 'bug', 'chore', 'needs-triage']) {
+      assert(
+        store.some((l) => l.name === name),
+        `${name} provisioned`,
+      );
+      assert(
+        s.calls().some((c) => c.startsWith(`label create ${name} `)),
+        `${name} was created via gh label create`,
+      );
+    }
+    assertEqual(store.find((l) => l.name === 'needs-triage').color, 'fef2c0');
   });
 });
 
-test('idempotent: second run leaves 8 labels exactly once and only reads', () => {
+test('idempotent: second run leaves 12 labels exactly once and only reads', () => {
   withStubGh([], (s) => {
     labels.ensureLabels(s.dir);
     s.resetLog();
     const r = labels.ensureLabels(s.dir);
     assertEqual(r.created.length, 0);
     assertEqual(r.updated.length, 0);
-    assertEqual(r.unchanged.length, 8);
-    assertEqual(s.read().length, 8, 'still exactly 8 labels');
+    assertEqual(r.unchanged.length, 12);
+    assertEqual(s.read().length, 12, 'still exactly 12 labels');
     assertEqual(s.calls().length, 1, 'second run makes no mutating gh calls');
     assert(s.calls()[0].startsWith('label list'), 'the one call is the read');
   });
@@ -122,8 +144,8 @@ test('drifted color/description is edited in place, never re-created', () => {
     const r = labels.ensureLabels(s.dir);
     assertEqual(r.updated.sort().join(','), 'verity:approved,verity:ready');
     assertEqual(r.created.length, 0);
-    assertEqual(r.unchanged.length, 6);
-    assertEqual(s.read().length, 8);
+    assertEqual(r.unchanged.length, 10);
+    assertEqual(s.read().length, 12);
     assertEqual(s.read().find((l) => l.name === 'verity:ready').color, '1d76db');
     assert(
       s.calls().every((c) => !c.startsWith('label create')),
@@ -132,8 +154,11 @@ test('drifted color/description is edited in place, never re-created', () => {
   });
 });
 
-test('never deletes: foreign labels survive and no delete verb is ever issued', () => {
+test('never deletes: a foreign label survives; `bug` is adopted via edit, never re-created', () => {
   const foreign = [
+    // `bug` is now one of OUR labels (#188). A pre-existing `bug` (a GitHub
+    // default) is UPSERTED in place — edited to our color/description, never
+    // duplicate-created — so it stops being a foreign survivor.
     { name: 'bug', color: 'ee0701', description: '' },
     { name: 'verity:legacy', color: 'cccccc', description: 'not ours to remove' },
   ];
@@ -141,8 +166,20 @@ test('never deletes: foreign labels survive and no delete verb is ever issued', 
     labels.ensureLabels(s.dir);
     labels.ensureLabels(s.dir);
     const names = s.read().map((l) => l.name);
-    assert(names.includes('bug') && names.includes('verity:legacy'), 'foreign labels intact');
-    assertEqual(s.read().length, 10, '8 verity labels + 2 foreign, exactly once each');
+    assert(names.includes('verity:legacy'), 'the purely-foreign label is intact');
+    assert(names.includes('bug'), 'the adopted `bug` label is present exactly once');
+    // 12 verity labels (8 verity:* + feature/bug/chore/needs-triage) + the one
+    // untouched foreign label — `bug` was absorbed, not added alongside.
+    assertEqual(s.read().length, 13, '12 verity labels + 1 foreign, exactly once each');
+    assertEqual(
+      s.read().find((l) => l.name === 'bug').color,
+      'd73a4a',
+      'the pre-existing bug was upserted to our color',
+    );
+    assert(
+      s.calls().every((c) => !c.startsWith('label create bug')),
+      'bug was edited, never re-created',
+    );
     assert(
       s.calls().every((c) => !c.includes('delete')),
       'no gh label delete, ever',
@@ -150,18 +187,18 @@ test('never deletes: foreign labels survive and no delete verb is ever issued', 
   });
 });
 
-test('install dispatch ensures labels; running install twice yields 8 exactly once', () => {
+test('install dispatch ensures labels; running install twice yields 12 exactly once', () => {
   withStubGh([], (s) => {
     const target = fs.mkdtempSync(path.join(os.tmpdir(), 'verity-labels-target-'));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'verity-labels-home-'));
     const first = install.dispatch([], { target, home, cwd: s.dir });
     assertEqual(first.harness, 'claude');
     assertEqual(first.labels.ok, true);
-    assertEqual(first.labels.created.length, 8);
+    assertEqual(first.labels.created.length, 12);
     const second = install.dispatch([], { target, home, cwd: s.dir });
     assertEqual(second.labels.created.length, 0);
-    assertEqual(second.labels.unchanged.length, 8);
-    assertEqual(s.read().length, 8, 'install twice → the 8 labels exactly once');
+    assertEqual(second.labels.unchanged.length, 12);
+    assertEqual(s.read().length, 12, 'install twice → the 12 labels exactly once');
   });
 });
 
@@ -197,7 +234,7 @@ test('partial gh failure: remaining labels still attempted, failures reported', 
   };
   const r = labels.ensureLabels('/tmp', run);
   assertEqual(r.ok, false);
-  assertEqual(r.created.length, 7);
+  assertEqual(r.created.length, 11);
   assertEqual(r.failed.length, 1);
   assertEqual(r.failed[0].name, 'verity:ready');
   assertEqual(r.failed[0].error, 'HTTP 502 from gh');

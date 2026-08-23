@@ -210,8 +210,8 @@ test('characterize: exact argv order; variadic --allowed-tools is the LAST flag'
   assert(argv[1].includes('Echo hi'), 'argv[1] is the rendered prompt');
   assertEqual(
     JSON.stringify(argv.slice(2, 7)),
-    JSON.stringify(['--output-format', 'stream-json', '--verbose', '--max-turns', '40']),
-    'fixed flag order, default --max-turns 40',
+    JSON.stringify(['--output-format', 'stream-json', '--verbose', '--max-turns', '80']),
+    'fixed flag order, default --max-turns 80 (stage 74)',
   );
   assertEqual(argv[7], '--allowed-tools', '--allowed-tools directly after --max-turns');
   assertEqual(

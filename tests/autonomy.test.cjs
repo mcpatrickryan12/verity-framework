@@ -33,6 +33,20 @@ function deepEqual(actual, expected, msg) {
   assertEqual(JSON.stringify(actual, null, 1), JSON.stringify(expected, null, 1), msg);
 }
 
+// Stage 79 (ADR-0029): the effective policy loadPolicy returns ALWAYS carries
+// the resolved `substrate` field ('github' when the file omits it) — DEFAULTS
+// stays the pure §2 document (the knob is DEFAULT-ABSENT there, like
+// containment_tier), so the resolved shape is DEFAULTS plus the one field.
+// Stage 86 (ADR-0030): likewise `gate_runner` — absent resolves to the
+// substrate's native runner ('github-actions' on github), so the resolved
+// shape gains exactly one more field and NOTHING else changes (the stage-86
+// kill-switch regression: byte-identical apart from the new resolved field).
+const RESOLVED_DEFAULTS = {
+  ...autonomy.DEFAULTS,
+  substrate: 'github',
+  gate_runner: 'github-actions',
+};
+
 // --- YAML subset parser ---
 
 test('parseYaml: the full §2 example document round-trips into the §2 defaults', () => {
@@ -133,15 +147,15 @@ test('parseYaml: rejects unsupported YAML with line info instead of misparsing',
 
 // --- loader: defaults + hard invariants ---
 
-test('loadPolicy: missing file → exact §2 defaults', () => {
+test('loadPolicy: missing file → exact §2 defaults (+ stage-79 resolved substrate)', () => {
   const dir = tmpProject();
-  deepEqual(autonomy.loadPolicy(dir), autonomy.DEFAULTS, 'defaults when no file');
+  deepEqual(autonomy.loadPolicy(dir), RESOLVED_DEFAULTS, 'defaults when no file');
 });
 
 test('loadPolicy: empty / comment-only file → defaults', () => {
   const dir = tmpProject();
   writePolicy(dir, '# nothing here\n\n');
-  deepEqual(autonomy.loadPolicy(dir), autonomy.DEFAULTS, 'defaults for empty file');
+  deepEqual(autonomy.loadPolicy(dir), RESOLVED_DEFAULTS, 'defaults for empty file');
 });
 
 test('loadPolicy: file merges over defaults without clobbering siblings', () => {
@@ -200,13 +214,13 @@ test('cli: autonomy show prints the effective policy; --json is one compact line
   const dir = tmpProject();
   const pretty = run(['autonomy', 'show'], dir);
   assertEqual(pretty.code, 0, 'show exits 0');
-  deepEqual(JSON.parse(pretty.out), autonomy.DEFAULTS, 'show = effective defaults');
+  deepEqual(JSON.parse(pretty.out), RESOLVED_DEFAULTS, 'show = effective defaults');
 
   const piped = run(['autonomy', 'show', '--json'], dir);
   assertEqual(piped.code, 0, 'show --json exits 0');
   const lines = piped.out.split('\n').filter(Boolean);
   assertEqual(lines.length, 1, '--json emits exactly one line');
-  deepEqual(JSON.parse(lines[0]), autonomy.DEFAULTS, '--json payload');
+  deepEqual(JSON.parse(lines[0]), RESOLVED_DEFAULTS, '--json payload');
 });
 
 // --- CLI: set ---
@@ -525,6 +539,124 @@ test('stage 14 knob: the shipped JSON schema publishes it with NO default', () =
   assert(/autonomous/.test(knob.description), 'and says what tier 2 unlocks');
 });
 
+// --- stage 54 (ADR-0024): agent.roles — per-role override map (additive) ---
+
+test('stage 54 schema: absent agent.roles ⇒ the effective agent block is unchanged', () => {
+  // The kill-switch: no roles map means byte-identical to a pre-stage-54 policy.
+  for (const text of ['', 'mode: supervised\n', 'agent:\n  provider: codex\n']) {
+    const dir = tmpProject();
+    writePolicy(dir, text);
+    assertEqual(autonomy.loadPolicy(dir).agent.roles, undefined, 'no roles key materializes');
+  }
+});
+
+test('stage 54 schema: a valid per-role override map loads and merges over defaults', () => {
+  const dir = tmpProject();
+  writePolicy(
+    dir,
+    [
+      'agent:',
+      '  provider: claude',
+      '  roles:',
+      '    build:',
+      '      model: cheap-model',
+      '    review:',
+      '      provider: codex',
+      '      model: gpt-5-codex',
+      '      sandbox: read-only',
+      '      approval: never',
+      '      containment_tier: 2',
+      '',
+    ].join('\n'),
+  );
+  const roles = autonomy.loadPolicy(dir).agent.roles;
+  assertEqual(roles.build.model, 'cheap-model', 'a partial (model-only) override loads');
+  assertEqual(roles.review.provider, 'codex', 'a per-role codex override loads');
+  assertEqual(roles.review.containment_tier, 2, 'with its own tier');
+});
+
+test('stage 54 schema: an UNKNOWN role key is a load error (fail closed)', () => {
+  const dir = tmpProject();
+  writePolicy(dir, 'agent:\n  roles:\n    deploy:\n      model: x\n');
+  loadRejects(dir, 'unknown role', 'a role the worker never dispatches is refused');
+});
+
+test('stage 54 schema: per-role enums use the SAME validation as the base block', () => {
+  const badProvider = tmpProject();
+  writePolicy(badProvider, 'agent:\n  roles:\n    build:\n      provider: gemini\n');
+  loadRejects(badProvider, 'agent.roles.build.provider', 'a bad per-role provider is rejected');
+
+  const badSandbox = tmpProject();
+  writePolicy(
+    badSandbox,
+    'agent:\n  provider: codex\n  roles:\n    review:\n      sandbox: yolo\n',
+  );
+  loadRejects(badSandbox, 'agent.roles.review.sandbox', 'a bad per-role sandbox value is rejected');
+
+  const unknownKey = tmpProject();
+  writePolicy(unknownKey, 'agent:\n  roles:\n    build:\n      ignore_rules: true\n');
+  loadRejects(unknownKey, 'unknown key', 'a run-wide-only knob is not a per-role key');
+});
+
+test('stage 54 cross-field: per-role codex knobs are refused when the role resolves to claude', () => {
+  // base claude, role sets no provider ⇒ resolves claude ⇒ sandbox is meaningless.
+  const dir = tmpProject();
+  writePolicy(dir, 'agent:\n  provider: claude\n  roles:\n    review:\n      sandbox: read-only\n');
+  loadRejects(dir, 'only meaningful with codex', 'a codex knob under a claude role is refused');
+
+  // But base codex + role omits provider ⇒ resolves codex ⇒ the same knob is fine.
+  const ok = tmpProject();
+  writePolicy(ok, 'agent:\n  provider: codex\n  roles:\n    review:\n      sandbox: read-only\n');
+  assertEqual(
+    autonomy.loadPolicy(ok).agent.roles.review.sandbox,
+    'read-only',
+    'the effective provider (base codex) makes the per-role knob meaningful',
+  );
+});
+
+test('stage 54 cross-field: a per-role sandbox/approval override may only NARROW the base', () => {
+  const widerSandbox = tmpProject();
+  writePolicy(
+    widerSandbox,
+    'agent:\n  provider: codex\n  sandbox: read-only\n  roles:\n    review:\n      sandbox: workspace-write\n',
+  );
+  loadRejects(widerSandbox, 'WIDEN', 'workspace-write over a read-only base is refused');
+
+  const widerApproval = tmpProject();
+  writePolicy(
+    widerApproval,
+    'agent:\n  provider: codex\n  approval: untrusted\n  roles:\n    review:\n      approval: never\n',
+  );
+  loadRejects(widerApproval, 'WIDEN', 'never over an untrusted base is refused');
+
+  // Narrowing is allowed: workspace-write base, read-only role.
+  const narrower = tmpProject();
+  writePolicy(
+    narrower,
+    'agent:\n  provider: codex\n  sandbox: workspace-write\n  roles:\n    build:\n      sandbox: read-only\n',
+  );
+  assertEqual(
+    autonomy.loadPolicy(narrower).agent.roles.build.sandbox,
+    'read-only',
+    'read-only over a workspace-write base narrows and is accepted',
+  );
+});
+
+test('stage 54 schema: the shipped JSON schema publishes agent.roles additively', () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', 'schemas', 'autonomy.schema.json'), 'utf8'),
+  );
+  const roles = schema.properties.agent.properties.roles;
+  assert(roles !== undefined, 'published in the shipped schema');
+  assert(!('default' in roles), 'no default — absence is the kill-switch');
+  assertEqual(
+    JSON.stringify(roles.propertyNames.enum),
+    '["build","plan","review"]',
+    'keyed on exactly the worker-dispatch roles',
+  );
+  assert(/ADR-0024/.test(roles.description), 'the description points at the decision');
+});
+
 test('cli: autonomy set agent.provider codex writes and validates; enums enforced', () => {
   const dir = tmpProject();
   assertEqual(run(['autonomy', 'set', 'agent.provider', 'codex'], dir).code, 0, 'set provider');
@@ -546,4 +678,260 @@ test('cli: setting a codex-only knob under claude refuses to write invalid polic
   const res = run(['autonomy', 'set', 'agent.sandbox', 'read-only'], dir);
   assertEqual(res.code, 20, 'refused (provider is still claude)');
   assert(!fs.existsSync(path.join(dir, '.verity', 'autonomy.yml')), 'nothing written');
+});
+
+// --- stage 79 (ADR-0029): substrate — delivery-substrate seam (additive) ---
+
+test('stage 79 knob: absent substrate RESOLVES to github on the effective policy', () => {
+  // DEFAULT-ABSENT in the file, but the RESOLVED policy always carries the
+  // field — the single grep-able source of truth stages 80–84 branch on.
+  for (const text of ['', 'mode: supervised\n', 'agent:\n  provider: codex\n']) {
+    const dir = tmpProject();
+    writePolicy(dir, text);
+    assertEqual(
+      autonomy.loadPolicy(dir).substrate,
+      'github',
+      'absence resolves to github — byte-identical pre-stage-79 behavior',
+    );
+  }
+});
+
+test('stage 79 knob: explicit github resolves byte-identical to absent', () => {
+  // The kill-switch guarantee, stated as object equality: a file that writes
+  // `substrate: github` and a file that omits the key resolve to the SAME
+  // effective policy — nothing downstream can tell them apart.
+  const absent = tmpProject();
+  writePolicy(absent, 'mode: supervised\n');
+  const explicit = tmpProject();
+  writePolicy(explicit, 'mode: supervised\nsubstrate: github\n');
+  deepEqual(
+    autonomy.loadPolicy(explicit),
+    autonomy.loadPolicy(absent),
+    'explicit github ⇒ the byte-identical resolved policy',
+  );
+});
+
+test('stage 79/83 knob: local RESOLVES as a value and the worker entry now ADMITS it (stage 83 lifted the refusal)', () => {
+  // 'local' is a valid enum value; loading it is NOT a schema error. The
+  // stage-79 placeholder refusal at the worker's policy consumption was
+  // LIFTED by stage 83 (the local driver completed across stages 80–82), so
+  // the check now admits both schema enums and stays fail-closed only for
+  // values the engine cannot drive (unit callers passing raw policies).
+  const dir = tmpProject();
+  writePolicy(dir, 'substrate: local\n');
+  const policy = autonomy.loadPolicy(dir);
+  assertEqual(policy.substrate, 'local', 'local resolves as a value at load');
+
+  const worker = require('../verity/worker/index.cjs');
+  worker.assertSubstrateSupported(policy); // stage 83: no longer throws
+
+  // github — resolved or raw/absent (unit callers) — passes untouched.
+  worker.assertSubstrateSupported({ substrate: 'github' });
+  worker.assertSubstrateSupported({});
+
+  // The belt is still fail-closed for a substrate the engine cannot drive.
+  let threw = null;
+  try {
+    worker.assertSubstrateSupported({ substrate: 'sqlite' });
+  } catch (e) {
+    threw = e;
+  }
+  assert(threw !== null, 'an unknown substrate still refuses');
+  assertEqual(threw.exitCode, 30, 'refused as a startup infra error (exit 30)');
+  assertEqual(threw.slug, 'substrate-unimplemented', 'with its fail-closed slug');
+});
+
+test('stage 79 knob: a junk value is a load error naming the key and allowed values', () => {
+  const dir = tmpProject();
+  writePolicy(dir, 'substrate: gitlab\n');
+  loadRejects(dir, 'substrate', 'the load error names the key');
+  loadRejects(dir, 'github|local', 'and the allowed values — never a silent default');
+});
+
+test('stage 79 knob: the shipped JSON schema publishes it with NO default', () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', 'schemas', 'autonomy.schema.json'), 'utf8'),
+  );
+  const knob = schema.properties.substrate;
+  assert(knob !== undefined, 'published in the shipped schema');
+  assertEqual(JSON.stringify(knob.enum), '["github","local"]', 'exactly the two substrates');
+  assert(!('default' in knob), 'no default written — absence is the kill-switch (github)');
+  assert(/ADR-0029/.test(knob.description), 'the description points at the decision');
+  // Stage 90: the stage-79 placeholder text is gone — the description now
+  // records that 'local' executes (refusal lifted stage 83, driver landed
+  // stages 80–85), and the stale "not yet implemented" phrase must never
+  // resurface (the stage-89 gate_runner flip, applied to substrate).
+  assert(/EXECUTES as of stage 83/.test(knob.description), "'local' executes (stage 83)");
+  assert(!/not yet implemented/.test(knob.description), 'the stage-79 placeholder text is gone');
+  assert(/fail-closed/.test(knob.description), 'and the fail-closed unknown-value rule');
+});
+
+// --- stage 86 (ADR-0030): gate_runner — the gate-runner seam (additive) ------
+
+test('stage 86 knob: absent gate_runner RESOLVES to the substrate NATIVE runner', () => {
+  // github (explicit or absent substrate) ⇒ github-actions; local ⇒ direct —
+  // both byte-identical to today's behavior, and the resolved policy always
+  // carries the field (the single source of truth stages 87–89 branch on).
+  for (const text of ['', 'mode: supervised\n', 'substrate: github\n']) {
+    const dir = tmpProject();
+    writePolicy(dir, text);
+    assertEqual(
+      autonomy.loadPolicy(dir).gate_runner,
+      'github-actions',
+      `github substrate resolves the native github-actions runner (${JSON.stringify(text)})`,
+    );
+  }
+  const local = tmpProject();
+  writePolicy(local, 'substrate: local\n');
+  assertEqual(
+    autonomy.loadPolicy(local).gate_runner,
+    'direct',
+    'local substrate resolves the native direct runner',
+  );
+});
+
+test('stage 86 knob: explicit native values resolve byte-identical to absent (the kill-switch)', () => {
+  const absentLocal = tmpProject();
+  writePolicy(absentLocal, 'substrate: local\n');
+  const explicitLocal = tmpProject();
+  writePolicy(explicitLocal, 'substrate: local\ngate_runner: direct\n');
+  deepEqual(
+    autonomy.loadPolicy(explicitLocal),
+    autonomy.loadPolicy(absentLocal),
+    'local: explicit direct ⇒ the byte-identical resolved policy',
+  );
+  const absentGithub = tmpProject();
+  writePolicy(absentGithub, 'mode: supervised\n');
+  const explicitGithub = tmpProject();
+  writePolicy(explicitGithub, 'mode: supervised\ngate_runner: github-actions\n');
+  deepEqual(
+    autonomy.loadPolicy(explicitGithub),
+    autonomy.loadPolicy(absentGithub),
+    'github: explicit github-actions ⇒ the byte-identical resolved policy',
+  );
+});
+
+test('stage 86 knob: localhost and remote:<name> RESOLVE as values on the local substrate', () => {
+  // Placeholders resolve at load; the gate-execution call sites refuse them
+  // (gates.test.cjs covers the seam refusal + no-record guarantee).
+  const localhost = tmpProject();
+  writePolicy(localhost, 'substrate: local\ngate_runner: localhost\n');
+  assertEqual(autonomy.loadPolicy(localhost).gate_runner, 'localhost');
+  const remote = tmpProject();
+  writePolicy(remote, 'substrate: local\ngate_runner: remote:gpu-box.lan\n');
+  assertEqual(autonomy.loadPolicy(remote).gate_runner, 'remote:gpu-box.lan');
+});
+
+test('stage 86 knob: junk values are a load error naming the key and allowed values', () => {
+  const dir = tmpProject();
+  writePolicy(dir, 'gate_runner: jenkins\n');
+  loadRejects(dir, 'gate_runner', 'the load error names the key');
+  loadRejects(
+    dir,
+    'direct|localhost|remote:<name>|github-actions',
+    'and the allowed values — never a silent default',
+  );
+});
+
+test('stage 86 knob: remote: with an empty or unsafe name is a load error (fail closed)', () => {
+  for (const bad of ["'remote:'", "'remote:has space'", "'remote:no/slash'"]) {
+    const dir = tmpProject();
+    writePolicy(dir, `substrate: local\ngate_runner: ${bad}\n`);
+    loadRejects(dir, 'gate_runner', `${bad}: refused as an unknown value`);
+    loadRejects(dir, 'remote:<name>', `${bad}: the error shows the pattern`);
+  }
+});
+
+test('stage 86 REJECTED combination: substrate local + gate_runner github-actions refuses at load, byte-stable', () => {
+  const dir = tmpProject();
+  writePolicy(dir, 'substrate: local\ngate_runner: github-actions\n');
+  let threw = null;
+  try {
+    autonomy.loadPolicy(dir);
+  } catch (e) {
+    threw = e;
+  }
+  assert(threw !== null, 'the combination is a load refusal');
+  assertEqual(threw.exitCode, 20, 'PolicyError, exit 20');
+  assert(
+    threw.message.includes(
+      "gate_runner: 'github-actions' is refused on substrate 'local' — it presumes a pushed GitHub branch the local substrate says does not exist (ADR-0030); use direct, localhost, or remote:<name>",
+    ),
+    `byte-stable refusal message: ${threw.message}`,
+  );
+});
+
+test('stage 86: substrate github + any non-native runner is a v1 refusal at load (fail closed; admitting it later is additive)', () => {
+  for (const runner of ['direct', 'localhost', 'remote:gpu-box']) {
+    // Explicit github AND absent substrate (which resolves to github) both hit
+    // the same rule — set/validate/load agree on the effective substrate.
+    for (const substrateLine of ['substrate: github\n', '']) {
+      const dir = tmpProject();
+      writePolicy(dir, `${substrateLine}gate_runner: '${runner}'\n`);
+      loadRejects(dir, 'not supported in v1', `github + ${runner} refused`);
+      loadRejects(dir, 'ADR-0030', 'the refusal points at the decision');
+    }
+  }
+});
+
+test('stage 86 regression: a policy WITHOUT the key round-trips byte-identical apart from the new resolved field', () => {
+  const dir = tmpProject();
+  writePolicy(dir, 'mode: supervised\nreview:\n  trust: 1\n');
+  const policy = autonomy.loadPolicy(dir);
+  const { gate_runner, ...rest } = policy;
+  assertEqual(gate_runner, 'github-actions', 'the one new resolved field');
+  const expected = autonomy.enforceInvariants(
+    JSON.parse(JSON.stringify({ ...autonomy.DEFAULTS, mode: 'supervised' })),
+  );
+  expected.review.trust = 1;
+  expected.substrate = 'github';
+  deepEqual(rest, expected, 'everything else is the pre-stage-86 resolved policy, byte-identical');
+});
+
+test('stage 86 cli: autonomy set gate_runner writes valid combos and refuses invalid ones without writing', () => {
+  // local substrate: localhost is settable (resolves; the seam refusal lives
+  // at the gate-execution call sites, not in the policy).
+  const local = tmpProject();
+  assertEqual(run(['autonomy', 'set', 'substrate', 'local'], local).code, 0, 'set substrate');
+  assertEqual(run(['autonomy', 'set', 'gate_runner', 'localhost'], local).code, 0, 'set runner');
+  assertEqual(autonomy.loadPolicy(local).gate_runner, 'localhost', 'effective policy updated');
+  // local + github-actions: the REJECTED combination refuses at set time too.
+  const combo = run(['autonomy', 'set', 'gate_runner', 'github-actions'], local);
+  assertEqual(combo.code, 20, 'rejected combination refused');
+  assertEqual(autonomy.loadPolicy(local).gate_runner, 'localhost', 'file untouched');
+  // default (github) substrate: a non-native runner refuses, nothing written.
+  const github = tmpProject();
+  const v1 = run(['autonomy', 'set', 'gate_runner', 'localhost'], github);
+  assertEqual(v1.code, 20, 'github + localhost is the v1 refusal');
+  assert(!fs.existsSync(path.join(github, '.verity', 'autonomy.yml')), 'nothing written');
+  // junk value: the enum-shaped coerce error.
+  const junk = run(['autonomy', 'set', 'gate_runner', 'jenkins'], github);
+  assertEqual(junk.code, 20, 'junk refused');
+  assert(junk.err.includes('direct|localhost|remote:<name>|github-actions'), junk.err);
+});
+
+test('stage 86 knob: the shipped JSON schema publishes gate_runner with NO default', () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', 'schemas', 'autonomy.schema.json'), 'utf8'),
+  );
+  const knob = schema.properties.gate_runner;
+  assert(knob !== undefined, 'published in the shipped schema');
+  assert(!('default' in knob), 'no default written — absence is the kill-switch (native runner)');
+  assertEqual(
+    JSON.stringify(knob.anyOf[0].enum),
+    '["direct","localhost","github-actions"]',
+    'exactly the three literals',
+  );
+  assertEqual(
+    knob.anyOf[1].pattern,
+    '^remote:[A-Za-z0-9._-]+$',
+    'plus the remote:<name> pattern (non-empty, catalog-name-safe)',
+  );
+  assert(/ADR-0030/.test(knob.description), 'the description points at the decision');
+  // Stage 89: the last placeholder is gone — the description now records that
+  // every runner value executes, and the stale "not yet implemented" phrase
+  // must never resurface.
+  assert(/EXECUTES as of stage 89/.test(knob.description), 'remote:<name> executes (stage 89)');
+  assert(!/not yet implemented/.test(knob.description), 'the stage-86 placeholder text is gone');
+  assert(/fail-closed/.test(knob.description), 'and the fail-closed unknown-value rule');
 });

@@ -231,3 +231,38 @@ test('json() surfaces GhError from the underlying call (no retry on 4xx)', () =>
     assertEqual(s.calls().length, 1);
   });
 });
+
+// --- Stage 52 (#135): isRepoSlug — the repo-as-endpoint validator ------------
+//
+// A repo string is interpolated straight into the `gh api` PATH by
+// operator-act.cjs and worker/index.cjs, and `gh api` truncates the endpoint at
+// `?`/`#`. This predicate is the ONE shared shape check: GitHub's owner/name
+// charset exactly ([A-Za-z0-9._-]), one slash, no empty side.
+test('isRepoSlug accepts exactly GitHub owner/name and nothing else', () => {
+  for (const good of ['acme/widget', 'octo-org/my_repo.js', 'a/b', 'Acme.Corp/Widget-2', '_x/-y']) {
+    assertEqual(gh.isRepoSlug(good), true, `accepts ${JSON.stringify(good)}`);
+  }
+  for (const bad of [
+    'acme/widget?',
+    'acme/widget#',
+    'acme/widget#frag',
+    'acme/widget/branches/main/protection?',
+    'acme/widget/extra',
+    'acme/widget with space',
+    'acme/ widget',
+    'owner',
+    '',
+    '   ',
+    '/widget',
+    'acme/',
+    '../../x',
+    'acme/widget\n',
+    'https://github.com/acme/widget',
+    null,
+    undefined,
+    42,
+    { toString: () => 'acme/widget' },
+  ]) {
+    assertEqual(gh.isRepoSlug(bad), false, `refuses ${JSON.stringify(bad)}`);
+  }
+});

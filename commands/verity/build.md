@@ -56,6 +56,11 @@ green PR — this role NEVER merges (the builder must not merge its own work).
    ```bash
    verity stage pr $ARGUMENTS --issue <work-item-number>
    ```
+   On the **local substrate** (`substrate: local` in `.verity/autonomy.yml`) this
+   reports `opened: false` with a reason: there is NO PR surface — the pushed
+   stage branch IS the review handoff (ADR-0029, stage 85), and the engine runs
+   the committed gates itself. That is success, not a failure — do NOT retry it
+   and do NOT fall back to `gh` (no `gh` command works on the local substrate).
 
 6. Drive CI to green (**this stage's** executor fixes on the branch if red — resuming it
    within the stage is correct and unrestricted, including for a Reviewer's
@@ -69,3 +74,16 @@ green PR — this role NEVER merges (the builder must not merge its own work).
 
 7. Hand off to **/verity:review** for the merge. Do NOT merge.
 </process>
+
+Headless mode (running under `verity agent-exec`, no human present): report your
+handoff in the result marker. When the PR is open and CI is green — or your file
+changes are complete under containment (Verity's post-run checks confirm CI and the
+worker re-dispatches on red) — you are **DONE**: return `"outcome": "success"` with
+the PR number in `"artifacts": {"pr": <n>}`. Handing a green PR to the Reviewer is a
+**success**, not a park. You have NO merge tool and NO human gate to declare: the
+`review:merge` gate belongs to the reviewer's/worker's deterministic trust ladder
+(T13 — merge authority lives in the worker, never a role), so you must **NEVER**
+return `"outcome": "gated"` or `"gate": "review:merge"`. A builder that self-parks at
+a merge gate blocks review from ever running.
+
+Example: `{"verity":1,"outcome":"success","gate":null,"artifacts":{"pr":114},"reason":"PR #114 open, CI green (10/10) — handing off to review"}`
