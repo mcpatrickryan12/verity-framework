@@ -1,0 +1,31 @@
+# npm publish via Trusted Publishing (OIDC) — O4 resolution, Option C.
+# Trigger: pushing a v* tag. The npm-publish environment holds the human gate
+# (required reviewer) and restricts deployments to v* tags. No npm token is
+# stored anywhere: npm's trusted publisher exchanges this job's OIDC token for
+# a short-lived publish credential, and provenance is attested as a side
+# effect. package.json's prepublishOnly runs lint + tests in this clone before
+# the tarball leaves the runner.
+name: publish
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      id-token: write # OIDC exchange for trusted publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing needs npm >= 11.5.1; node 20's bundled npm is older,
+      # so pin the CLI instead of trusting the runner's default.
+      - run: npm install -g npm@^11.5.1
+      - run: npm ci
+      - run: npm publish
