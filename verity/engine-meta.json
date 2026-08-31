@@ -3,6 +3,7 @@
   "verity": {
     "claudeCodeMinVersion": "2.1.170",
     "codexMinVersion": "0.146.0",
+    "grokBuildMinVersion": "1.0.0",
     "knowingMinVersion": "0.15.1"
   }
 }

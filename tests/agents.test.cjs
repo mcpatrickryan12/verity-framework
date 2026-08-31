@@ -422,10 +422,11 @@ test('registry: getProvider("claude") returns the driver; listProviders() names 
   assertEqual(provider, claude, 'the registry hands out the claude.cjs module itself');
   // Generalized in stage 8: codex registered beside claude (spec: "stage 7's
   // characterization set generalized"); claude remains the reference driver.
+  // Generalized again for the Grok Build driver: grok registered beside them.
   assertEqual(
     JSON.stringify(registry.listProviders()),
-    '["claude","codex"]',
-    'claude + codex as of stage 8',
+    '["claude","codex","grok"]',
+    'claude + codex + grok',
   );
 });
 
@@ -439,7 +440,10 @@ test('registry: unknown provider → stable error listing valid providers', () =
   assert(thrown !== null, 'unknown id throws');
   assertEqual(thrown.name, 'AgentExecError');
   assertEqual(thrown.slug, 'unsupported-agent');
-  assertEqual(thrown.message, "unsupported agent 'opencode' — supported providers: claude, codex");
+  assertEqual(
+    thrown.message,
+    "unsupported agent 'opencode' — supported providers: claude, codex, grok",
+  );
   // Inherited Object.prototype names must not resolve to phantom providers.
   let proto = null;
   try {

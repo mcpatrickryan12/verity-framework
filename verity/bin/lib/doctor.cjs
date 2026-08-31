@@ -183,6 +183,26 @@ const CODEX_DEPENDENCIES = [
   },
 ];
 
+// The grok-selected registry (the CODEX_DEPENDENCIES pattern): git + gh are
+// runtime-neutral prerequisites; claude and codex are deliberately ABSENT — a
+// Grok-Build-only machine must be green. Grok Build documents no CLI auth
+// status probe suitable for scripting (auth is browser-based on first launch),
+// so the row is version-gated only; a signed-out binary surfaces at run time.
+const GROK_DEPENDENCIES = [
+  DEPENDENCIES[0], // git
+  DEPENDENCIES[1], // gh (+ auth status)
+  {
+    name: 'grok',
+    binary: 'grok',
+    versionArgs: ['--version'],
+    minVersionKey: 'grokBuildMinVersion',
+    remedies: {
+      missing: 'curl -fsSL https://x.ai/cli/install.sh | bash',
+      'too-old': 'curl -fsSL https://x.ai/cli/install.sh | bash',
+    },
+  },
+];
+
 // --- per-dependency report rows -----------------------------------------------
 
 // One registry row → one report row {name, present, version, ok, detail}
@@ -542,6 +562,85 @@ function remoteGateRunnerChecks(opts = {}) {
   return rows;
 }
 
+// --- grok environment rows ------------------------------------------------------
+// Beyond the binaries, a working Grok Build install needs what `verity install
+// --grok` writes: the flattened verity-*.md commands under ~/.grok/commands,
+// the engine internals they fall back to, and a matching install state. Same
+// row shape and remediation discipline as the codex rows.
+
+// User-scoped Grok Build host root — mirrors install.cjs grokDir() (GROK_HOME
+// is Grok Build's own relocation variable; opts.home is the seam).
+function grokRoot(opts = {}) {
+  const env = opts.env || process.env;
+  return env.GROK_HOME || path.join(opts.home || os.homedir(), '.grok');
+}
+
+function grokEnvironmentChecks(opts = {}) {
+  const root = grokRoot(opts);
+  const rows = [];
+
+  // Command discovery: flat verity-*.md files under <root>/commands.
+  const commandsDir = path.join(root, 'commands');
+  const expected = packagedRoleCount();
+  let count = 0;
+  try {
+    count = fs
+      .readdirSync(commandsDir)
+      .filter((n) => n.startsWith('verity-') && n.endsWith('.md')).length;
+  } catch {
+    // no commands dir at all — count stays 0
+  }
+  rows.push({
+    name: 'grok-commands',
+    present: count > 0,
+    version: null,
+    ok: count === expected && expected > 0,
+    detail:
+      count === expected && expected > 0
+        ? `${count}/${expected} verity-*.md commands discovered under ${commandsDir}`
+        : `Verity commands missing: ${count}/${expected} verity-*.md under ${commandsDir} — Run: verity install --grok`,
+  });
+
+  // Engine fallback path: installed commands invoke this when `verity` is not
+  // on PATH — commands without it discover fine and then cannot act.
+  const engine = path.join(root, 'verity', 'bin', 'verity.cjs');
+  const engineOk = fs.existsSync(engine);
+  rows.push({
+    name: 'grok-engine',
+    present: engineOk,
+    version: null,
+    ok: engineOk,
+    detail: engineOk
+      ? `engine fallback present at ${engine}`
+      : `engine internals missing (${engine}) — commands cannot reach the deterministic CLI — Run: verity install --grok`,
+  });
+
+  // Install state: written by installGrok; a missing file or a harness that is
+  // not 'grok' means this ~/.grok tree was not (or is no longer) a Verity
+  // Grok Build install — stale state, reinstall to reconcile.
+  const stateFile = path.join(root, 'verity', 'install-options.json');
+  let state = null;
+  let stateDetail = `no Grok Build install state (${stateFile}) — Run: verity install --grok`;
+  try {
+    state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    stateDetail =
+      state.harness === 'grok'
+        ? `install state ok (harness grok, ${stateFile})`
+        : `stale install state: harness is '${state.harness}', expected 'grok' (${stateFile}) — Run: verity install --grok`;
+  } catch {
+    // missing/unparsable — stateDetail already says stale/missing
+  }
+  rows.push({
+    name: 'grok-install-state',
+    present: state !== null,
+    version: null,
+    ok: state !== null && state.harness === 'grok',
+    detail: stateDetail,
+  });
+
+  return rows;
+}
+
 function runChecks(opts = {}) {
   // Stage 87 (ADR-0030): the resolved gate_runner travels beside the resolved
   // substrate — 'localhost' appends its Docker+act probe rows and (stage 88)
@@ -558,6 +657,14 @@ function runChecks(opts = {}) {
       ...gateRows,
     ];
   }
+  if (opts.agent === 'grok') {
+    const deps = opts.deps || GROK_DEPENDENCIES;
+    return [
+      ...deps.map((dep) => checkOrSkip(dep, opts)),
+      ...grokEnvironmentChecks(opts),
+      ...gateRows,
+    ];
+  }
   const deps = opts.deps || DEPENDENCIES;
   return [...deps.map((dep) => checkOrSkip(dep, opts)), ...gateRows];
 }
@@ -569,7 +676,7 @@ function exitCodeFor(checks) {
 
 // --- runtime selection (stage 9, codex-support.md §10.2) ------------------------
 
-const SUPPORTED_AGENTS = ['claude', 'codex'];
+const SUPPORTED_AGENTS = ['claude', 'codex', 'grok'];
 
 // Which runtime doctor checks, and WHY — precedence: explicit --agent flag →
 // `.verity/autonomy.yml` agent.provider (only when the FILE names one; the
@@ -582,7 +689,7 @@ function resolveAgent(flags = {}, opts = {}) {
   if (flags.agent !== undefined) {
     if (!SUPPORTED_AGENTS.includes(flags.agent)) {
       throw new Error(
-        `--agent must be one of ${SUPPORTED_AGENTS.join('|')}, got '${flags.agent}' — verity doctor [--quiet] [--agent claude|codex]`,
+        `--agent must be one of ${SUPPORTED_AGENTS.join('|')}, got '${flags.agent}' — verity doctor [--quiet] [--agent claude|codex|grok]`,
       );
     }
     return { agent: flags.agent, source: 'the --agent flag' };
@@ -607,7 +714,11 @@ function resolveAgent(flags = {}, opts = {}) {
 
   const env = opts.env || process.env;
   const home = opts.home || os.homedir();
-  const roots = [env.CLAUDE_CONFIG_DIR || path.join(home, '.claude'), path.join(home, '.agents')];
+  const roots = [
+    env.CLAUDE_CONFIG_DIR || path.join(home, '.claude'),
+    path.join(home, '.agents'),
+    env.GROK_HOME || path.join(home, '.grok'),
+  ];
   const found = new Map(); // harness → state file that declared it
   for (const root of roots) {
     const stateFile = path.join(root, 'verity', 'install-options.json');
@@ -634,7 +745,7 @@ function resolveAgent(flags = {}, opts = {}) {
 function dispatch(args, flags = {}) {
   if (args.length > 0) {
     throw new Error(
-      'doctor takes no positional arguments — verity doctor [--quiet] [--agent claude|codex]',
+      'doctor takes no positional arguments — verity doctor [--quiet] [--agent claude|codex|grok]',
     );
   }
   const selection = resolveAgent(flags);
@@ -669,6 +780,9 @@ function dispatch(args, flags = {}) {
 
 module.exports = {
   CODEX_DEPENDENCIES,
+  GROK_DEPENDENCIES,
+  grokEnvironmentChecks,
+  grokRoot,
   DEPENDENCIES,
   SUPPORTED_AGENTS,
   checkBinary,

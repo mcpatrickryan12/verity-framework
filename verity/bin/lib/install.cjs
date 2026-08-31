@@ -83,6 +83,7 @@ const HOST_PASSES = {
   claude: (content) => content,
   opencode: (content) => transformForOpenCode(content),
   codex: (content) => transformForCodex(content),
+  grok: (content) => transformForGrok(content),
 };
 
 // The pipeline core: compose preambles + role body, then apply the host pass.
@@ -263,6 +264,70 @@ function installOpenCode(opts = {}) {
   installed.push(deploymentMethods.label);
 
   return { harness: 'opencode', target, installed, deploymentMethods };
+}
+
+// --- Grok Build adapter ---
+
+// Grok Build home. GROK_HOME is Grok Build's own relocation variable
+// (user-guide 05-configuration.md); opts.target stays the test seam, matching
+// claudeDir/openCodeDir.
+function grokDir(opts) {
+  return opts.target || process.env.GROK_HOME || path.join(os.homedir(), '.grok');
+}
+
+// The Grok Build host pass (final pipeline pass — see HOST_PASSES). Grok Build
+// discovers flat `*.md` files under `~/.grok/commands/` as user-invocable
+// slash commands (filename stem = command name — Claude's legacy layout,
+// user-guide 08-skills.md), so roles install flattened as verity-<name>.md and
+// are invoked `/verity-<name>`. Transforms:
+// - frontmatter reduced to `description:` (the Claude-only `allowed-tools`
+//   allowlist is dropped from the COMMAND FILE — the paired .tools.json still
+//   travels beside it for headless agent-exec, where it becomes --allow flags)
+// - cross-role handoffs /verity:<role> → /verity-<role> (the flattened names)
+// - the engine fallback path moves to the Grok host root
+function transformForGrok(content) {
+  const m = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!m) {
+    return content;
+  }
+  const description = (m[1].match(/^description:\s*(.+)$/m) || [])[1] || '';
+  const body = m[2]
+    .replace(/\$HOME\/\.claude\/verity/g, '${GROK_HOME:-$HOME/.grok}/verity')
+    .replace(/\/verity:([a-z][a-z0-9-]*)/g, '/verity-$1');
+  return `---\ndescription: ${description}\n---\n${body}`;
+}
+
+function installGrok(opts = {}) {
+  const target = grokDir(opts);
+  const options = opts.options || {};
+  const installed = [];
+
+  // Role commands → <target>/commands/, flattened to verity-<name>.md
+  // (invoked /verity-<name>), rendered through the same pipeline (preambles
+  // first, transformForGrok as the final pass). The T06 allowlists travel
+  // beside them under the same flattened stem so the pair never separates.
+  const srcCommands = path.join(PKG_ROOT, 'commands', 'verity');
+  const destCommands = path.join(target, 'commands');
+  fs.mkdirSync(destCommands, { recursive: true });
+  for (const name of commandFiles(srcCommands)) {
+    const out = `verity-${name}`;
+    const rendered = renderRole(path.join(srcCommands, name), options, 'grok');
+    fs.writeFileSync(path.join(destCommands, out), rendered);
+    installed.push(path.join('commands', out));
+  }
+  for (const name of commandFiles(srcCommands, '.tools.json')) {
+    fs.copyFileSync(path.join(srcCommands, name), path.join(destCommands, `verity-${name}`));
+    installed.push(path.join('commands', `verity-${name}`));
+  }
+
+  copyInternals(target);
+  installed.push('verity/');
+  installed.push(writeInstallState(target, 'grok', options));
+
+  const deploymentMethods = seedDeploymentMethods(opts);
+  installed.push(deploymentMethods.label);
+
+  return { harness: 'grok', target, installed, deploymentMethods };
 }
 
 // --- Codex adapter (stage 6, ADR-0005/0006) ---
@@ -553,13 +618,13 @@ function installActions(opts = {}) {
 function dryRunRole(args, flags) {
   const role = typeof flags['dry-run'] === 'string' ? flags['dry-run'] : args[0];
   if (typeof role !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(role)) {
-    throw new Error('usage: verity install --dry-run <role> [--opencode|--codex]');
+    throw new Error('usage: verity install --dry-run <role> [--opencode|--codex|--grok]');
   }
   const roleFile = path.join(PKG_ROOT, 'commands', 'verity', `${role}.md`);
   if (!fs.existsSync(roleFile)) {
     throw new Error(`unknown role '${role}' (no commands/verity/${role}.md)`);
   }
-  const host = flags.codex ? 'codex' : flags.opencode ? 'opencode' : 'claude';
+  const host = flags.codex ? 'codex' : flags.opencode ? 'opencode' : flags.grok ? 'grok' : 'claude';
   const rendered = renderRole(roleFile, conditionalOptions(flags), host);
   return { dryRun: true, role, host, rendered, raw: rendered };
 }
@@ -568,7 +633,7 @@ function dispatch(args, flags) {
   let result;
   // Harness flags are mutually exclusive — checked first so every mode
   // (dry-run included) rejects an ambiguous selection instead of guessing.
-  const hosts = ['claude', 'opencode', 'codex', 'gemini'].filter((h) => flags[h]);
+  const hosts = ['claude', 'opencode', 'codex', 'grok', 'gemini'].filter((h) => flags[h]);
   if (hosts.length > 1) {
     throw new Error(
       `--${hosts[0]} and --${hosts[1]} are mutually exclusive — pick one harness per install`,
@@ -599,9 +664,11 @@ function dispatch(args, flags) {
     result = installOpenCode({ target: flags.target, home: flags.home, options });
   } else if (flags.codex) {
     result = installCodex({ target: flags.target, home: flags.home, options });
+  } else if (flags.grok) {
+    result = installGrok({ target: flags.target, home: flags.home, options });
   } else if (flags.gemini) {
     throw new Error(
-      'the gemini adapter is not implemented yet (use --claude | --opencode | --codex)',
+      'the gemini adapter is not implemented yet (use --claude | --opencode | --codex | --grok)',
     );
   } else {
     result = installClaude({ target: flags.target, home: flags.home, options });
@@ -630,6 +697,9 @@ module.exports = {
   transformForOpenCode,
   openCodeDir,
   installCodex,
+  installGrok,
+  transformForGrok,
+  grokDir,
   stampEngineMeta,
   ENGINE_META_REL,
   transformForCodex,

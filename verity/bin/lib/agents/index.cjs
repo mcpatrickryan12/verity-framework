@@ -15,6 +15,7 @@ const { AgentExecError } = require('./result-contract.cjs');
 const PROVIDERS = {
   claude: require('./claude.cjs'),
   codex: require('./codex.cjs'),
+  grok: require('./grok.cjs'),
 };
 
 function listProviders() {

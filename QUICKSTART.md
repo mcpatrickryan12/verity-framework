@@ -22,11 +22,12 @@ node -v && git --version && gh auth status
 npm i -g verity-framework
 
 # connect it to your assistant:
-verity install --claude        # or: --opencode | --codex
+verity install --claude        # or: --opencode | --codex | --grok
 ```
 
 > On the **Codex CLI**? The install flag, invocation syntax, and autonomy limits
-> differ — see [Codex CLI](#codex-cli) below.
+> differ — see [Codex CLI](#codex-cli) below. On **Grok Build**? See
+> [Grok Build](#grok-build) below.
 
 > Autonomy is opt-in and off by default — you get the hand-driven roles out of
 > the box; enable the headless worker later with `/verity:autonomy-setup`.
@@ -215,6 +216,47 @@ Each failing row names its own remediation command; the common ones:
 | `stale install state: harness is '…'` | `~/.agents` isn't a Codex install | `verity install --codex` |
 
 ---
+
+## Grok Build
+
+Verity also runs on xAI's **Grok Build** (`grok`). Everything above applies,
+with the install flag, the invocation syntax, and autonomy scope differing:
+
+```bash
+npm i -g verity-framework
+verity install --grok                # commands → ~/.grok/commands/verity-<role>.md
+verity doctor --agent grok           # checks git, gh + auth, grok, commands, engine
+```
+
+Then, inside Grok Build, invoke a role with the flattened syntax (same shape as
+OpenCode):
+
+```
+/verity-vision
+```
+
+Headless single-role runs are supported:
+
+```bash
+verity agent-exec build 7 --run-id r1 --agent grok --max-turns 40 --json
+```
+
+The role's `.tools.json` allowlist is passed as Grok `--allow` permission rules
+— the entries Grok's rule grammar can express travel verbatim (an entry it
+cannot express, like `Task`, is dropped; the uncovered call then fails closed
+at runtime), no auto-approve flag is ever passed, and Grok's headless mode
+refuses any tool call no rule covers. Worker/Actions autonomy for Grok is
+deferred — use Claude or Codex for autonomy today.
+
+### Troubleshooting `verity doctor --agent grok`
+
+| Row | Meaning | Fix |
+|---|---|---|
+| `grok not runnable …` | Grok Build missing | `curl -fsSL https://x.ai/cli/install.sh \| bash` |
+| `grok X is below the pinned minimum …` | Below 1.0.0 (the v1.0 headless flag surface) | re-run the installer above |
+| `Verity commands missing: N/M verity-*.md …` | Roles not installed for Grok | `verity install --grok` |
+| `engine internals missing …` | Deterministic CLI unreachable from the commands | `verity install --grok` |
+| `stale install state: harness is '…'` | `~/.grok` isn't a Verity Grok install | `verity install --grok` |
 
 ## Where to go next
 

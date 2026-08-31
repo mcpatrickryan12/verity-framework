@@ -8,7 +8,7 @@ Most AI coding tools stop when the code is written — leaving you to find out l
 
 It does that by running your project as a sequence of specialized AI roles — a vision assistant, an architect, a builder, a reviewer, a release operator, a verifier, and more — that hand work to each other through clear contracts, with **GitHub as the single source of truth**. It's CI/CD-native and GitHub-native by design, built for projects going *beyond a prototype* into real, operated production. (Verity is a clean-room successor to [spec-driven-devops](https://www.npmjs.com/package/spec-driven-devops) 1.4.)
 
-> 📦 Published as [`verity-framework`](https://www.npmjs.com/package/verity-framework) on npm · works with **Claude Code**, **Codex CLI**, and **OpenCode**.
+> 📦 Published as [`verity-framework`](https://www.npmjs.com/package/verity-framework) on npm · works with **Claude Code**, **Codex CLI**, **OpenCode**, and **Grok Build**.
 
 ## Get started
 
@@ -53,7 +53,7 @@ node -v && git --version && gh auth status
 npm i -g verity-framework
 
 # connect it to your assistant:
-verity install --claude        # or: --opencode | --codex
+verity install --claude        # or: --opencode | --codex | --grok
 
 # from here on, one command checks every host dependency (git, gh + auth, claude):
 verity doctor
@@ -61,7 +61,7 @@ verity doctor
 
 ### Host matrix
 
-Verity runs on three hosts. Install flag, interactive syntax, and where headless
+Verity runs on four hosts. Install flag, interactive syntax, and where headless
 / autonomy is available differ per host — this table is the honest summary:
 
 | Host | Install | Interactive invocation | Headless (`agent-exec`) | Local autonomy worker | GitHub Actions autonomy |
@@ -69,6 +69,7 @@ Verity runs on three hosts. Install flag, interactive syntax, and where headless
 | **Claude Code** | `verity install --claude` | `/verity:vision` | Supported | Supported | Supported |
 | **Codex CLI** | `verity install --codex` | `$verity-vision` | Supported (tier-1 containment) | Supervised: supported · unattended: opt-in tier-2, default off | **Deferred — local only (ADR-0009)** |
 | **OpenCode** | `verity install --opencode` | `/verity-vision` | Interactive only | Interactive only | Interactive only |
+| **Grok Build** | `verity install --grok` | `/verity-vision` | Supported | Deferred | Deferred |
 
 Full Codex walkthrough, autonomy config, and troubleshooting: **[QUICKSTART.md → Codex CLI](QUICKSTART.md#codex-cli)**.
 
@@ -84,6 +85,17 @@ exec` ignores permission profiles, so Verity keeps Codex runs safe by
 **containment** (absent credentials + post-run invariants + an opt-in tier-2
 disposable workspace), not by Codex enforcing the role policy. GitHub Actions
 autonomy for Codex is deferred; run the Codex worker locally only.
+
+**Grok Build users:** `verity install --grok` installs the roles as flat
+commands under `~/.grok/commands/verity-<role>.md` (engine under
+`~/.grok/verity`; `GROK_HOME` honored), invoked `/verity-vision` — the same
+flattened syntax as OpenCode. Check host deps with `verity doctor --agent
+grok`. Headless runs use `verity agent-exec <role> --agent grok`: the role's
+`.tools.json` allowlist travels as Grok `--allow` permission rules (the entries
+Grok's rule grammar can express; the rest fail closed at runtime), no
+auto-approve flag is ever passed, and Grok's own headless mode refuses any tool
+call no rule covers. Requires Grok Build ≥ 1.0.0 and a signed-in `grok` binary;
+worker/Actions autonomy for Grok is deferred.
 
 > Autonomy is opt-in and off by default — installing gives you the hand-driven
 > roles; enable the worker later with `/verity:autonomy-setup` when you want it.
