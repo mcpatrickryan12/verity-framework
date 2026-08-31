@@ -29,7 +29,7 @@
 //       → proceed (token ceilings remain the bound; null NEVER counts as $0);
 //     success → loop }
 // Stage 9 (ADR-0005/0007): the run resolves ONE immutable agent config from
-// the policy's `agent` block (provider claude|codex, model, sandbox/approval
+// the policy's `agent` block (provider claude|codex|grok, model, sandbox/approval
 // narrowing overrides) and passes it — plus the REMAINING wall-clock budget
 // as --timeout-secs, shrinking monotonically — into every chained dispatch.
 // plus the T13 trust ladder (§4.5): when the REVIEW role completes with

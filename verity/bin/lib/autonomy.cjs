@@ -414,7 +414,11 @@ const SPEC = {
   agent: {
     type: 'map',
     keys: {
-      provider: { type: 'enum', values: ['claude', 'codex'] },
+      // grok joins the enum at the claude tier (its harness enforces the
+      // role's --allow rules at run time and performs its own git, so every
+      // codex-only branch — containment tiers, state snapshots, capability
+      // acknowledgements — correctly stays codex-gated).
+      provider: { type: 'enum', values: ['claude', 'codex', 'grok'] },
       model: { type: 'stringOrNull' },
       sandbox: { type: 'enumOrNull', values: ['read-only', 'workspace-write'] },
       approval: { type: 'enumOrNull', values: ['untrusted', 'on-request', 'never'] },

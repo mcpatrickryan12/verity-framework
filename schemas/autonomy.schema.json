@@ -117,7 +117,7 @@
       "properties": {
         "provider": {
           "description": "Headless runtime the worker dispatches roles to.",
-          "enum": ["claude", "codex"],
+          "enum": ["claude", "codex", "grok"],
           "default": "claude"
         },
         "model": {
@@ -163,7 +163,7 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "provider": { "enum": ["claude", "codex"] },
+                "provider": { "enum": ["claude", "codex", "grok"] },
                 "model": { "type": ["string", "null"] },
                 "sandbox": { "enum": ["read-only", "workspace-write", null] },
                 "approval": { "enum": ["untrusted", "on-request", "never", null] },

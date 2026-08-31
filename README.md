@@ -69,7 +69,7 @@ Verity runs on four hosts. Install flag, interactive syntax, and where headless
 | **Claude Code** | `verity install --claude` | `/verity:vision` | Supported | Supported | Supported |
 | **Codex CLI** | `verity install --codex` | `$verity-vision` | Supported (tier-1 containment) | Supervised: supported · unattended: opt-in tier-2, default off | **Deferred — local only (ADR-0009)** |
 | **OpenCode** | `verity install --opencode` | `/verity-vision` | Interactive only | Interactive only | Interactive only |
-| **Grok Build** | `verity install --grok` | `/verity-vision` | Supported | Deferred | Deferred |
+| **Grok Build** | `verity install --grok` | `/verity-vision` | Supported | Supported | Deferred |
 
 Full Codex walkthrough, autonomy config, and troubleshooting: **[QUICKSTART.md → Codex CLI](QUICKSTART.md#codex-cli)**.
 
@@ -94,8 +94,14 @@ grok`. Headless runs use `verity agent-exec <role> --agent grok`: the role's
 `.tools.json` allowlist travels as Grok `--allow` permission rules (the entries
 Grok's rule grammar can express; the rest fail closed at runtime), no
 auto-approve flag is ever passed, and Grok's own headless mode refuses any tool
-call no rule covers. Requires Grok Build ≥ 1.0.0 and a signed-in `grok` binary;
-worker/Actions autonomy for Grok is deferred.
+call no rule covers. Requires Grok Build ≥ 1.0.0 and a signed-in `grok` binary.
+The **local autonomy worker** can select grok (`agent.provider: grok` in
+`.verity/autonomy.yml`) on the claude-tier trust path — grok's harness enforces
+the role allowlist and performs its own git, so none of the codex containment
+knobs apply (setting one is rejected). Cost note: grok stamps real cost on
+API-key traffic; a subscription login may report cost UNKNOWN, which the
+worker's `unknown_cost_behavior` (default: pause at the human gate) handles
+honestly. GitHub Actions autonomy for Grok is deferred.
 
 > Autonomy is opt-in and off by default — installing gives you the hand-driven
 > roles; enable the worker later with `/verity:autonomy-setup` when you want it.

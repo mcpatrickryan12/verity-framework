@@ -554,3 +554,75 @@ test('doctor: resolveAgent honors --agent grok and a grok install state', () => 
   const fromState = doctor.resolveAgent({ cwd: home }, { home, env: {} });
   assertEqual(fromState.agent, 'grok', 'install state under ~/.grok is a selection signal');
 });
+
+// --- autonomy: worker-selectable grok (the claude-tier trust path) ---
+// grok's harness enforces the role's --allow rules at run time and performs
+// its own git (both source-verified above), so it validates and dispatches on
+// the claude side of every codex-only branch: no containment tiers, no state
+// snapshots, no capability acknowledgements.
+
+const autonomy = require('../verity/bin/lib/autonomy.cjs');
+const worker = require('../verity/worker/index.cjs');
+
+test('autonomy: agent.provider grok validates, base and per-role', () => {
+  assertEqual(
+    JSON.stringify(autonomy.validatePolicy({ agent: { provider: 'grok' } })),
+    '[]',
+    'base provider grok is a valid policy',
+  );
+  assertEqual(
+    JSON.stringify(
+      autonomy.validatePolicy({
+        agent: { provider: 'claude', roles: { build: { provider: 'grok' } } },
+      }),
+    ),
+    '[]',
+    'per-role override to grok is a valid policy',
+  );
+});
+
+test('autonomy: the codex-only knobs stay codex-only under provider grok', () => {
+  const errors = autonomy.validatePolicy({
+    agent: {
+      provider: 'grok',
+      sandbox: 'read-only',
+      containment_tier: 2,
+      acknowledged_enforcement_gaps: ['network'],
+    },
+  });
+  assert(
+    errors.some((e) => e.includes('agent.sandbox')),
+    'sandbox rejected for grok',
+  );
+  assert(
+    errors.some((e) => e.includes('agent.containment_tier')),
+    'containment_tier rejected for grok',
+  );
+  assert(
+    errors.some((e) => e.includes('acknowledged_enforcement_gaps')),
+    'acknowledgement knob rejected for grok',
+  );
+});
+
+test('worker: autonomous grok needs no containment tier (codex still does)', () => {
+  const grokPolicy = { mode: 'autonomous', agent: { provider: 'grok' } };
+  worker.assertContainmentTier(grokPolicy, worker.resolveEffectiveAgent(grokPolicy));
+
+  const codexPolicy = { mode: 'autonomous', agent: { provider: 'codex' } };
+  let err = null;
+  try {
+    worker.assertContainmentTier(codexPolicy, worker.resolveEffectiveAgent(codexPolicy));
+  } catch (e) {
+    err = e;
+  }
+  assert(err?.message.includes('tier-2'), 'the codex gate is untouched');
+});
+
+test('worker: resolveEffectiveAgent resolves a per-role grok override', () => {
+  const resolved = worker.resolveEffectiveAgent({
+    agent: { provider: 'claude', roles: { build: { provider: 'grok' } } },
+  });
+  assertEqual(resolved.base.provider, 'claude');
+  assertEqual(resolved.agentForRole('build').provider, 'grok');
+  assertEqual(resolved.agentForRole('review').provider, 'claude');
+});

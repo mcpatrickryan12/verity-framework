@@ -245,8 +245,26 @@ The role's `.tools.json` allowlist is passed as Grok `--allow` permission rules
 — the entries Grok's rule grammar can express travel verbatim (an entry it
 cannot express, like `Task`, is dropped; the uncovered call then fails closed
 at runtime), no auto-approve flag is ever passed, and Grok's headless mode
-refuses any tool call no rule covers. Worker/Actions autonomy for Grok is
-deferred — use Claude or Codex for autonomy today.
+refuses any tool call no rule covers.
+
+The **local autonomy worker** can drive grok. Minimal `.verity/autonomy.yml`:
+
+```yaml
+mode: supervised
+review:
+  trust: 0
+agent:
+  provider: grok
+```
+
+grok sits on the claude-tier trust path — its harness enforces the role
+allowlist and performs its own git — so the codex knobs
+(`sandbox`/`approval`/`containment_tier`/`acknowledged_enforcement_gaps`) are
+rejected under `provider: grok`. One cost note: grok stamps real cost on
+API-key traffic, while a subscription login may report cost UNKNOWN — the
+worker's `limits.unknown_cost_behavior` (default: pause at the existing human
+gate) decides what happens then. GitHub Actions autonomy for Grok is deferred —
+run the worker locally.
 
 ### Troubleshooting `verity doctor --agent grok`
 

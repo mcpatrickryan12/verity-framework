@@ -6,7 +6,7 @@
 // up through the registry. This file must never regain provider specifics.
 //
 //   verity agent-exec build 7 --run-id <id> [--max-turns N] [--timeout-secs N]
-//     [--agent claude|codex]
+//     [--agent claude|codex|grok]
 //
 // Flow:
 //   1. Resolve role → commands/verity/<role>.md prompt file + its REQUIRED
@@ -105,7 +105,7 @@ const DEFAULT_MAX_TURNS = 80;
 // run-id and role become path components under ~/.verity/logs — keep them tame.
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const USAGE =
-  'usage: verity agent-exec <role> [args...] --run-id <id> [--max-turns N] [--timeout-secs N] [--agent claude|codex] [--model M] [--sandbox S] [--approval A] [--acknowledge-gaps c1,c2] [--containment-tier 1|2] [--keep-workspace] [--state-snapshot JSON] [--substrate github|local]';
+  'usage: verity agent-exec <role> [args...] --run-id <id> [--max-turns N] [--timeout-secs N] [--agent claude|codex|grok] [--model M] [--sandbox S] [--approval A] [--acknowledge-gaps c1,c2] [--containment-tier 1|2] [--keep-workspace] [--state-snapshot JSON] [--substrate github|local]';
 // ADR-0011 enforcement tiers. Tier 1 (stage 11: credential stripping +
 // mandatory post-run invariants) is what every codex run has had since that
 // stage and stays the DEFAULT. Tier 2 (stage 14: disposable shaped workspace +
